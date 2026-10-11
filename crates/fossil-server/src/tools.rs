@@ -195,6 +195,43 @@ pub struct EditRoadmapItemInput {
     pub position: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PortingProjectInput {
+    #[schemars(
+        description = "Local source directory containing at most 32 C files and 256 KiB of C source. No headers or preprocessor directives in this version."
+    )]
+    pub source_path: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PortingJobInput {
+    pub job_id: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PortingContextInput {
+    pub job_id: String,
+    pub function_name: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RustCandidateInput {
+    pub job_id: String,
+    pub rust_source: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VerifyPortInput {
+    pub job_id: String,
+    pub entry_function: String,
+    #[schemars(
+        description = "1 to 256 cases, each an array of int32 arguments matching the C function signature."
+    )]
+    pub cases: Vec<Vec<i32>>,
+}
+fn porting_error(error: anyhow::Error) -> McpError {
+    McpError::internal_error(format!("{error:#}"), None)
+}
+fn porting_engine() -> Result<reforge_engine::Engine, McpError> {
+    reforge_engine::Engine::from_env().map_err(porting_error)
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 /// The Reforge-MCP server.
@@ -214,7 +251,7 @@ impl ReforgeServer {
 #[tool_router]
 impl ReforgeServer {
     #[tool(
-        description = "Report implemented and planned Rust porting capabilities. This tool does not translate code or probe installed analysis backends."
+        description = "Report implemented Rust porting capabilities and explicit limitations. Does not probe installed compilers."
     )]
     async fn get_porting_capabilities(
         &self,
@@ -223,26 +260,139 @@ impl ReforgeServer {
         Ok(json!({
             "schema_version": 1,
             "product": "reforge-mcp",
-            "stage": "foundation",
+            "stage": "c_vertical_slice",
             "target_language": "rust",
-            "planned_source_languages": ["c", "cpp", "java", "python", "go"],
+            "implemented_source_languages": ["c"],
+            "planned_source_languages": ["cpp", "java", "python", "go"],
             "implemented": {
                 "source_lookup_languages": ["rust", "python", "typescript", "javascript"],
                 "source_lookup": true,
                 "persistent_roadmaps": true,
-                "rust_generation": false,
-                "behavioral_verification": false
+                "persistent_porting_jobs": true,
+                "rust_generation": "deterministic_clang_ast_int32_subset",
+                "behavioral_verification": "fixture_level_library_functions"
             },
             "analysis_backends": {
+                "clang_ast": "implemented_for_c_porting",
                 "tree_sitter": "implemented_for_source_lookup",
                 "joern": "planned_not_integrated"
             },
-            "planned_workflow": [
-                "analyze_porting_project", "create_porting_plan", "get_porting_context",
-                "submit_rust_candidate", "verify_port", "get_porting_report"
-            ],
-            "verification_policy": "Compilation alone is insufficient. Port acceptance requires source-to-Rust behavioral evidence and explicit unsupported cases."
+            "porting_workflow": ["analyze_porting_project", "create_porting_plan", "get_porting_context", "generate_rust", "submit_rust_candidate", "verify_port", "get_porting_report", "list_porting_jobs"],
+            "requirements": ["clang with UBSan", "rustc", "cargo"],
+            "supported_c": "int32 library functions, arithmetic, comparisons, branches, initialized locals, direct internal calls; no main, headers, preprocessor, pointers, globals, loops, or external dependencies",
+            "execution": "local host with time/output limits; not an OS security sandbox",
+            "verification_policy": "Completion means the submitted entry-function fixtures passed on the pinned source and candidate; not whole-program equivalence. Undefined behavior in source cases blocks acceptance."
         }).to_string())
+    }
+
+    #[tool(
+        description = "Snapshot and analyze a local C library project using Clang AST. Reject unsupported features and persist the job with analysis evidence. Does not run target functions."
+    )]
+    async fn analyze_porting_project(
+        &self,
+        Parameters(input): Parameters<PortingProjectInput>,
+    ) -> Result<String, McpError> {
+        let engine = porting_engine()?;
+        let job = engine
+            .analyze(std::path::Path::new(&input.source_path))
+            .await
+            .map_err(porting_error)?;
+        Ok(json!(job).to_string())
+    }
+
+    #[tool(
+        description = "Persist a dependency-ordered C-to-Rust plan, grouping recursive functions together. Analysis must have no unsupported features."
+    )]
+    async fn create_porting_plan(
+        &self,
+        Parameters(input): Parameters<PortingJobInput>,
+    ) -> Result<String, McpError> {
+        Ok(porting_engine()?
+            .plan(&input.job_id)
+            .map_err(porting_error)?
+            .to_string())
+    }
+
+    #[tool(
+        description = "Read a snapshotted translation unit, typed function mapping, dependencies, and semantic constraints for a porting job."
+    )]
+    async fn get_porting_context(
+        &self,
+        Parameters(input): Parameters<PortingContextInput>,
+    ) -> Result<String, McpError> {
+        Ok(porting_engine()?
+            .context(&input.job_id, &input.function_name)
+            .map_err(porting_error)?
+            .to_string())
+    }
+
+    #[tool(
+        description = "Generate a dependency-free Cargo library from supported Clang AST functions. Creates a new immutable candidate attempt; does not mark the port completed."
+    )]
+    async fn generate_rust(
+        &self,
+        Parameters(input): Parameters<PortingJobInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            porting_engine()?
+                .generate(&input.job_id)
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+
+    #[tool(
+        description = "Store an agent-written Rust src/lib.rs as a new candidate. Keep the generated rf_<C function name> signatures. Compilation and behavior are verified separately."
+    )]
+    async fn submit_rust_candidate(
+        &self,
+        Parameters(input): Parameters<RustCandidateInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            porting_engine()?
+                .submit(&input.job_id, &input.rust_source)
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+
+    #[tool(
+        description = "Build and execute the original C and Rust candidate on local host with supplied int32 cases. Uses UBSan for C, offline Cargo, and bounded processes. Stores compiler versions, logs, hashes and per-case comparisons. Completion only covers these entry-function fixtures."
+    )]
+    async fn verify_port(
+        &self,
+        Parameters(input): Parameters<VerifyPortInput>,
+    ) -> Result<String, McpError> {
+        let job = porting_engine()?
+            .verify(&input.job_id, &input.entry_function, input.cases)
+            .await
+            .map_err(porting_error)?;
+        Ok(json!(job).to_string())
+    }
+
+    #[tool(
+        description = "Resume a persistent porting job by reading its current report and all verification attempts. Changed sources or candidates invalidate current completion; interrupted operations are reported explicitly."
+    )]
+    async fn get_porting_report(
+        &self,
+        Parameters(input): Parameters<PortingJobInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            porting_engine()?
+                .report(&input.job_id)
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+
+    #[tool(
+        description = "List up to 100 persisted porting jobs, newest first. Use get_porting_report for fresh evidence and source/candidate drift checks."
+    )]
+    async fn list_porting_jobs(
+        &self,
+        Parameters(_input): Parameters<ListIndexedReposInput>,
+    ) -> Result<String, McpError> {
+        Ok(porting_engine()?.list().map_err(porting_error)?.to_string())
     }
 
     #[tool(
@@ -1341,7 +1491,7 @@ impl ReforgeServer {
 #[tool_handler(
     name = "reforge-mcp",
     version = "0.1.0",
-    instructions = "Reforge-MCP is transitioning to verified Rust porting for C, C++, Java, Python, and Go. Call get_porting_capabilities first to distinguish implemented tools from planned features. Current tools provide source lookup and persistent roadmaps. Rust generation, Joern integration, and behavioral verification are not implemented yet. Existing source workflow: clone_reference, index_repo, locate_implementation, get_symbol_source."
+    instructions = "Reforge-MCP ports a restricted C int32 library subset to Rust. Start with get_porting_capabilities. Workflow: analyze_porting_project, create_porting_plan, generate_rust (or get_porting_context and submit_rust_candidate), verify_port with explicit entry-function cases, get_porting_report. Verification executes local code with limits, not a security sandbox. Completion is fixture-scoped; C++, Java, Python, Go porting and Joern integration remain planned. Source lookup and generic roadmap tools remain available."
 )]
 impl ServerHandler for ReforgeServer {}
 

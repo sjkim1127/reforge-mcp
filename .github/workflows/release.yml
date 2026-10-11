@@ -153,6 +153,8 @@ jobs:
             "${{ steps.bin.outputs.name }}" \
             README.md \
             docs \
+            scripts \
+            fixtures/porting \
             LICENSE
           echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 
@@ -163,7 +165,7 @@ jobs:
         run: |
           $archive = "${{ steps.archive.outputs.name }}.zip"
           Copy-Item "${{ steps.bin.outputs.path }}" "${{ steps.bin.outputs.name }}"
-          Compress-Archive -Path "${{ steps.bin.outputs.name }}", "README.md", "docs", "LICENSE" `
+          Compress-Archive -Path "${{ steps.bin.outputs.name }}", "README.md", "docs", "scripts", "fixtures", "LICENSE" `
                            -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 

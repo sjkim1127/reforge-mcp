@@ -5,6 +5,7 @@ members = [
     "crates/fossil-indexer",
     "crates/fossil-search",
     "crates/fossil-server",
+    "crates/reforge-engine",
 ]
 resolver = "2"
 
