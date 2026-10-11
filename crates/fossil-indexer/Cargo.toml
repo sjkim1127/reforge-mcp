@@ -1,6 +1,6 @@
 [package]
 name = "fossil-indexer"
-description = "Tree-sitter based symbol extractor and call graph builder for fossil-mcp"
+description = "Tree-sitter based symbol extractor and call graph builder for Reforge-MCP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

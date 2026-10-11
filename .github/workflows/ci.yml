@@ -155,7 +155,7 @@ jobs:
       # Cache the cloned test repositories between runs.
       # Key includes date (YYYY-MM) so the cache is refreshed monthly
       # in case upstream repos change significantly.
-      - name: Cache fossil-mcp repo clones
+      - name: Cache Reforge-MCP repo clones
         uses: actions/cache@v4
         with:
           path: ${{ env.FOSSIL_CACHE_DIR }}

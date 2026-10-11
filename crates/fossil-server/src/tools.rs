@@ -148,15 +148,62 @@ pub struct UnwatchWorkspaceInput {
     pub workspace_path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateGoalInput {
+    pub title: String,
+    pub description: Option<String>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AddRoadmapItemInput {
+    pub goal_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub position: Option<i64>,
+    pub depends_on: Option<Vec<String>>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateRoadmapItemInput {
+    pub item_id: String,
+    pub status: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetRoadmapInput {
+    pub goal_id: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListGoalsInput {}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateGoalInput {
+    pub goal_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteRoadmapItemInput {
+    pub item_id: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoadmapHistoryInput {
+    pub goal_id: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditRoadmapItemInput {
+    pub item_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub position: Option<i64>,
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
-/// The fossil-mcp MCP server.
+/// The Reforge-MCP server.
 #[derive(Clone)]
-pub struct FossilServer {
+pub struct ReforgeServer {
     watchers: Arc<Mutex<HashMap<String, WorkspaceWatcher>>>,
 }
 
-impl FossilServer {
+impl ReforgeServer {
     pub fn new() -> Self {
         Self {
             watchers: Arc::new(Mutex::new(HashMap::new())),
@@ -165,11 +212,252 @@ impl FossilServer {
 }
 
 #[tool_router]
-impl FossilServer {
+impl ReforgeServer {
+    #[tool(
+        description = "Report implemented and planned Rust porting capabilities. This tool does not translate code or probe installed analysis backends."
+    )]
+    async fn get_porting_capabilities(
+        &self,
+        Parameters(_input): Parameters<ListIndexedReposInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!({
+            "schema_version": 1,
+            "product": "reforge-mcp",
+            "stage": "foundation",
+            "target_language": "rust",
+            "planned_source_languages": ["c", "cpp", "java", "python", "go"],
+            "implemented": {
+                "source_lookup_languages": ["rust", "python", "typescript", "javascript"],
+                "source_lookup": true,
+                "persistent_roadmaps": true,
+                "rust_generation": false,
+                "behavioral_verification": false
+            },
+            "analysis_backends": {
+                "tree_sitter": "implemented_for_source_lookup",
+                "joern": "planned_not_integrated"
+            },
+            "planned_workflow": [
+                "analyze_porting_project", "create_porting_plan", "get_porting_context",
+                "submit_rust_candidate", "verify_port", "get_porting_report"
+            ],
+            "verification_policy": "Compilation alone is insufficient. Port acceptance requires source-to-Rust behavioral evidence and explicit unsupported cases."
+        }).to_string())
+    }
+
+    #[tool(
+        description = "Edit a roadmap milestone's title, description, or order without recreating it."
+    )]
+    async fn edit_roadmap_item(
+        &self,
+        Parameters(i): Parameters<EditRoadmapItemInput>,
+    ) -> Result<String, McpError> {
+        if i.title.is_none() && i.description.is_none() && i.position.is_none() {
+            return Err(McpError::invalid_params(
+                "at least one field must be provided",
+                None,
+            ));
+        }
+        if i.position.is_some_and(|position| position < 0) {
+            return Err(McpError::invalid_params(
+                "position must be non-negative",
+                None,
+            ));
+        }
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        s.edit_roadmap_item(
+            &i.item_id,
+            i.title.as_deref(),
+            i.description.as_deref(),
+            i.position,
+            Utc::now(),
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(json!({"item_id":i.item_id,"updated":true}).to_string())
+    }
+
+    #[tool(description = "Return the append-only history of roadmap changes for a goal.")]
+    async fn get_roadmap_history(
+        &self,
+        Parameters(i): Parameters<RoadmapHistoryInput>,
+    ) -> Result<String, McpError> {
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(serde_json::to_string(
+            &s.roadmap_history(&i.goal_id)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )
+        .unwrap())
+    }
+
+    #[tool(
+        description = "Update a goal title, description, or lifecycle status: active, paused, completed, or cancelled."
+    )]
+    async fn update_goal(
+        &self,
+        Parameters(i): Parameters<UpdateGoalInput>,
+    ) -> Result<String, McpError> {
+        if let Some(status) = &i.status
+            && !matches!(
+                status.as_str(),
+                "active" | "paused" | "completed" | "cancelled"
+            )
+        {
+            return Err(McpError::invalid_params(
+                "status must be active, paused, completed, or cancelled",
+                None,
+            ));
+        }
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        s.update_goal(
+            &i.goal_id,
+            i.title.as_deref(),
+            i.description.as_deref(),
+            i.status.as_deref(),
+            Utc::now(),
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(json!({"goal_id":i.goal_id,"updated":true}).to_string())
+    }
+
+    #[tool(
+        description = "Delete a roadmap milestone. Refuses deletion when another milestone depends on it."
+    )]
+    async fn delete_roadmap_item(
+        &self,
+        Parameters(i): Parameters<DeleteRoadmapItemInput>,
+    ) -> Result<String, McpError> {
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        s.delete_roadmap_item(&i.item_id, Utc::now())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(json!({"item_id":i.item_id,"deleted":true}).to_string())
+    }
+
+    #[tool(description = "List all persisted goals so an existing roadmap can be resumed.")]
+    async fn list_goals(
+        &self,
+        Parameters(_): Parameters<ListGoalsInput>,
+    ) -> Result<String, McpError> {
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(serde_json::to_string(
+            &s.list_goals()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )
+        .unwrap())
+    }
+
+    #[tool(description = "Create a durable roadmap goal. Returns a goal_id for adding milestones.")]
+    async fn create_goal(
+        &self,
+        Parameters(i): Parameters<CreateGoalInput>,
+    ) -> Result<String, McpError> {
+        let now = Utc::now();
+        let id = format!("goal-{}", now.timestamp_nanos_opt().unwrap_or_default());
+        let g = fossil_core::Goal {
+            id: id.clone(),
+            title: i.title,
+            description: i.description,
+            status: "active".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        s.create_goal(&g)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(serde_json::to_string(&g).unwrap())
+    }
+
+    #[tool(
+        description = "Add an ordered milestone to a goal. Milestones can depend on earlier item IDs."
+    )]
+    async fn add_roadmap_item(
+        &self,
+        Parameters(i): Parameters<AddRoadmapItemInput>,
+    ) -> Result<String, McpError> {
+        let now = Utc::now();
+        let id = format!("item-{}", now.timestamp_nanos_opt().unwrap_or_default());
+        let item = fossil_core::RoadmapItem {
+            id: id.clone(),
+            goal_id: i.goal_id,
+            title: i.title,
+            description: i.description,
+            status: "planned".into(),
+            position: i.position.unwrap_or(0),
+            depends_on: i.depends_on.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        s.add_roadmap_item(&item)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(serde_json::to_string(&item).unwrap())
+    }
+
+    #[tool(
+        description = "Update a roadmap milestone status: planned, in_progress, blocked, or done."
+    )]
+    async fn update_roadmap_item(
+        &self,
+        Parameters(i): Parameters<UpdateRoadmapItemInput>,
+    ) -> Result<String, McpError> {
+        if !matches!(
+            i.status.as_str(),
+            "planned" | "in_progress" | "blocked" | "done"
+        ) {
+            return Err(McpError::invalid_params(
+                "status must be planned, in_progress, blocked, or done",
+                None,
+            ));
+        }
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        s.update_roadmap_item(&i.item_id, &i.status, Utc::now())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(json!({"item_id":i.item_id,"status":i.status}).to_string())
+    }
+
+    #[tool(
+        description = "Return a goal roadmap with ordered milestones, dependencies, and computed progress percentage."
+    )]
+    async fn get_roadmap(
+        &self,
+        Parameters(i): Parameters<GetRoadmapInput>,
+    ) -> Result<String, McpError> {
+        let s = fossil_core::storage::GlobalStore::open(&fossil_core::storage::global_db_path())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let (g, items) = s
+            .roadmap(&i.goal_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let done = items.iter().filter(|x| x.status == "done").count();
+        let progress = if items.is_empty() {
+            0.0
+        } else {
+            done as f64 / items.len() as f64 * 100.0
+        };
+        let actionable: Vec<_> = items
+            .iter()
+            .filter(|item| {
+                g.status == "active"
+                    && item.status == "planned"
+                    && item.depends_on.iter().all(|dep| {
+                        items
+                            .iter()
+                            .any(|candidate| candidate.id == *dep && candidate.status == "done")
+                    })
+            })
+            .collect();
+        Ok(json!({"goal":g,"items":items,"next_actions":actionable,"progress_percent":progress,"completed":done,"total":items.len()}).to_string())
+    }
     // ── clone_reference ──────────────────────────────────────────────────────
 
     #[tool(
-        description = "Clone a public git repository into the local fossil-mcp cache. Reuses existing clones unless refresh=true. Returns repo_id needed for subsequent calls."
+        description = "Clone a public git repository into the local Reforge-MCP cache. Reuses existing clones unless refresh=true. Returns repo_id needed for subsequent calls."
     )]
     async fn clone_reference(
         &self,
@@ -507,7 +795,7 @@ impl FossilServer {
     // ── list_indexed_repos ───────────────────────────────────────────────────
 
     #[tool(
-        description = "List all repositories present in the fossil-mcp cache, including indexing status."
+        description = "List all repositories present in the Reforge-MCP cache, including indexing status."
     )]
     async fn list_indexed_repos(
         &self,
@@ -1051,11 +1339,11 @@ impl FossilServer {
 }
 
 #[tool_handler(
-    name = "fossil-mcp",
+    name = "reforge-mcp",
     version = "0.1.0",
-    instructions = "fossil-mcp locates exact implementations inside open-source repos. Workflow: 1) clone_reference to clone a repo, 2) index_repo to parse symbols, 3) locate_implementation to search."
+    instructions = "Reforge-MCP is transitioning to verified Rust porting for C, C++, Java, Python, and Go. Call get_porting_capabilities first to distinguish implemented tools from planned features. Current tools provide source lookup and persistent roadmaps. Rust generation, Joern integration, and behavioral verification are not implemented yet. Existing source workflow: clone_reference, index_repo, locate_implementation, get_symbol_source."
 )]
-impl ServerHandler for FossilServer {}
+impl ServerHandler for ReforgeServer {}
 
 #[cfg(test)]
 mod tests {
@@ -1090,7 +1378,7 @@ mod tests {
         }
         init_tracing();
 
-        let server = FossilServer::new();
+        let server = ReforgeServer::new();
         let res = server
             .analyze_feature(Parameters(AnalyzeFeatureInput {
                 repo_url: "https://github.com/dtolnay/itoa".to_string(),
@@ -1117,7 +1405,7 @@ mod tests {
         }
         init_tracing();
 
-        let server = FossilServer::new();
+        let server = ReforgeServer::new();
 
         // Step 1 – clone (small, popular Rust crate for reproducibility)
         let clone_res = server

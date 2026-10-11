@@ -120,6 +120,24 @@ impl GlobalStore {
                 symbol_id INTEGER PRIMARY KEY,
                 embedding float[384]
             );
+
+            CREATE TABLE IF NOT EXISTS goals (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT,
+                status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS roadmap_items (
+                id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                title TEXT NOT NULL, description TEXT, status TEXT NOT NULL DEFAULT 'planned',
+                position INTEGER NOT NULL, depends_on TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_roadmap_items_goal ON roadmap_items(goal_id, position);
+            CREATE TABLE IF NOT EXISTS roadmap_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id TEXT NOT NULL,
+                item_id TEXT, event_type TEXT NOT NULL, from_status TEXT,
+                to_status TEXT, created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_roadmap_events_goal ON roadmap_events(goal_id, created_at);
             ",
         )?;
         // Dynamic migrations for existing DBs (ignore errors if column already exists)
@@ -143,6 +161,374 @@ impl GlobalStore {
             CREATE INDEX IF NOT EXISTS idx_symbols_source ON symbols(source);
             CREATE INDEX IF NOT EXISTS idx_symbols_package ON symbols(package_name, package_version);
             ",
+        )?;
+        Ok(())
+    }
+
+    pub fn create_goal(&self, goal: &crate::types::Goal) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO goals VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                goal.id,
+                goal.title,
+                goal.description,
+                goal.status,
+                goal.created_at.to_rfc3339(),
+                goal.updated_at.to_rfc3339()
+            ],
+        )?;
+        self.record_roadmap_event(
+            &goal.id,
+            None,
+            "goal_created",
+            None,
+            Some(&goal.status),
+            goal.created_at,
+        )?;
+        Ok(())
+    }
+    fn record_roadmap_event(
+        &self,
+        goal_id: &str,
+        item_id: Option<&str>,
+        event_type: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        self.conn.execute("INSERT INTO roadmap_events (goal_id,item_id,event_type,from_status,to_status,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![goal_id,item_id,event_type,from_status,to_status,now.to_rfc3339()])?;
+        Ok(())
+    }
+    pub fn roadmap_history(
+        &self,
+        goal_id: &str,
+    ) -> Result<Vec<crate::types::RoadmapEvent>, StorageError> {
+        let mut s=self.conn.prepare("SELECT id,goal_id,item_id,event_type,from_status,to_status,created_at FROM roadmap_events WHERE goal_id=?1 ORDER BY id DESC")?;
+        let rows = s.query_map(params![goal_id], |r| {
+            Ok(crate::types::RoadmapEvent {
+                id: r.get(0)?,
+                goal_id: r.get(1)?,
+                item_id: r.get(2)?,
+                event_type: r.get(3)?,
+                from_status: r.get(4)?,
+                to_status: r.get(5)?,
+                created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(6)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?
+                    .with_timezone(&Utc),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+    pub fn list_goals(&self) -> Result<Vec<crate::types::Goal>, StorageError> {
+        let mut stmt = self.conn.prepare("SELECT id,title,description,status,created_at,updated_at FROM goals ORDER BY updated_at DESC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::types::Goal {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                description: r.get(2)?,
+                status: r.get(3)?,
+                created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(4)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(5)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?
+                    .with_timezone(&Utc),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+    pub fn update_goal(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        status: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        if status == Some("completed") {
+            let incomplete: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM roadmap_items WHERE goal_id=?1 AND status!='done'",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if incomplete > 0 {
+                return Err(StorageError::InvalidRoadmap(format!(
+                    "goal cannot be completed while {} milestone(s) remain unfinished",
+                    incomplete
+                )));
+            }
+        }
+        let old_status: String = self
+            .conn
+            .query_row("SELECT status FROM goals WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    StorageError::InvalidRoadmap(format!("goal '{}' does not exist", id))
+                } else {
+                    StorageError::Sqlite(e)
+                }
+            })?;
+        let changed = self.conn.execute("UPDATE goals SET title=COALESCE(?1,title), description=COALESCE(?2,description), status=COALESCE(?3,status), updated_at=?4 WHERE id=?5", params![title, description, status, now.to_rfc3339(), id])?;
+        if changed == 0 {
+            return Err(StorageError::InvalidRoadmap(format!(
+                "goal '{}' does not exist",
+                id
+            )));
+        }
+        if let Some(new_status) = status
+            && new_status != old_status
+        {
+            self.record_roadmap_event(
+                id,
+                None,
+                "goal_status_changed",
+                Some(&old_status),
+                Some(new_status),
+                now,
+            )?;
+        }
+        Ok(())
+    }
+    pub fn add_roadmap_item(&self, item: &crate::types::RoadmapItem) -> Result<(), StorageError> {
+        let goal_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM goals WHERE id=?1)",
+            params![item.goal_id],
+            |r| r.get(0),
+        )?;
+        if !goal_exists {
+            return Err(StorageError::InvalidRoadmap(format!(
+                "goal '{}' does not exist",
+                item.goal_id
+            )));
+        }
+        if item.depends_on.iter().any(|id| id == &item.id) {
+            return Err(StorageError::InvalidRoadmap(
+                "an item cannot depend on itself".into(),
+            ));
+        }
+        for dep in &item.depends_on {
+            let valid: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM roadmap_items WHERE id=?1 AND goal_id=?2)",
+                params![dep, item.goal_id],
+                |r| r.get(0),
+            )?;
+            if !valid {
+                return Err(StorageError::InvalidRoadmap(format!(
+                    "dependency '{}' is missing or belongs to another goal",
+                    dep
+                )));
+            }
+        }
+        let position = if item.position == 0 {
+            self.conn.query_row(
+                "SELECT COALESCE(MAX(position)+1, 0) FROM roadmap_items WHERE goal_id=?1",
+                params![item.goal_id],
+                |r| r.get::<_, i64>(0),
+            )?
+        } else {
+            item.position
+        };
+        self.conn.execute(
+            "INSERT INTO roadmap_items VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                item.id,
+                item.goal_id,
+                item.title,
+                item.description,
+                item.status,
+                position,
+                serde_json::to_string(&item.depends_on).unwrap(),
+                item.created_at.to_rfc3339(),
+                item.updated_at.to_rfc3339()
+            ],
+        )?;
+        self.record_roadmap_event(
+            &item.goal_id,
+            Some(&item.id),
+            "item_created",
+            None,
+            Some(&item.status),
+            item.created_at,
+        )?;
+        self.conn.execute(
+            "UPDATE goals SET updated_at=?1 WHERE id=?2",
+            params![item.updated_at.to_rfc3339(), item.goal_id],
+        )?;
+        Ok(())
+    }
+    pub fn roadmap(
+        &self,
+        goal_id: &str,
+    ) -> Result<(crate::types::Goal, Vec<crate::types::RoadmapItem>), StorageError> {
+        let g = self
+            .conn
+            .query_row(
+                "SELECT id,title,description,status,created_at,updated_at FROM goals WHERE id=?1",
+                params![goal_id],
+                |r| {
+                    Ok(crate::types::Goal {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        description: r.get(2)?,
+                        status: r.get(3)?,
+                        created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(4)?)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                        updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(5)?)
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    })
+                },
+            )
+            .map_err(StorageError::Sqlite)?;
+        let mut s=self.conn.prepare("SELECT id,goal_id,title,description,status,position,depends_on,created_at,updated_at FROM roadmap_items WHERE goal_id=?1 ORDER BY position,id")?;
+        let rows = s
+            .query_map(params![goal_id], |r| {
+                let deps: String = r.get(6)?;
+                Ok(crate::types::RoadmapItem {
+                    id: r.get(0)?,
+                    goal_id: r.get(1)?,
+                    title: r.get(2)?,
+                    description: r.get(3)?,
+                    status: r.get(4)?,
+                    position: r.get(5)?,
+                    depends_on: serde_json::from_str(&deps).unwrap_or_default(),
+                    created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(7)?)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(8)?)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((g, rows))
+    }
+    pub fn update_roadmap_item(
+        &self,
+        id: &str,
+        status: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let (goal_id, deps, old_status): (String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT goal_id, depends_on, status FROM roadmap_items WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    StorageError::InvalidRoadmap(format!("item '{}' does not exist", id))
+                } else {
+                    StorageError::Sqlite(e)
+                }
+            })?;
+        if status == "in_progress" || status == "done" {
+            let dependencies: Vec<String> = serde_json::from_str(&deps).unwrap_or_default();
+            for dep in dependencies {
+                let dep_status: String = self
+                    .conn
+                    .query_row(
+                        "SELECT status FROM roadmap_items WHERE id=?1 AND goal_id=?2",
+                        params![dep, goal_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| {
+                        StorageError::InvalidRoadmap(
+                            "dependency is missing or belongs to another goal".to_string(),
+                        )
+                    })?;
+                if dep_status != "done" {
+                    return Err(StorageError::InvalidRoadmap(format!(
+                        "dependency is not done (status: {})",
+                        dep_status
+                    )));
+                }
+            }
+        }
+        let changed = self.conn.execute(
+            "UPDATE roadmap_items SET status=?1,updated_at=?2 WHERE id=?3",
+            params![status, now.to_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::InvalidRoadmap(format!(
+                "item '{}' does not exist",
+                id
+            )));
+        }
+        self.record_roadmap_event(
+            &goal_id,
+            Some(id),
+            "status_changed",
+            Some(&old_status),
+            Some(status),
+            now,
+        )?;
+        self.conn.execute("UPDATE goals SET status=CASE WHEN (SELECT COUNT(*) FROM roadmap_items WHERE goal_id=?1)=0 THEN 'active' WHEN (SELECT COUNT(*) FROM roadmap_items WHERE goal_id=?1 AND status='done')=(SELECT COUNT(*) FROM roadmap_items WHERE goal_id=?1) THEN 'completed' ELSE 'active' END, updated_at=?2 WHERE id=?1", params![goal_id, now.to_rfc3339()])?;
+        Ok(())
+    }
+    pub fn edit_roadmap_item(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        position: Option<i64>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let goal_id: String = self
+            .conn
+            .query_row(
+                "SELECT goal_id FROM roadmap_items WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    StorageError::InvalidRoadmap(format!("item '{}' does not exist", id))
+                } else {
+                    StorageError::Sqlite(e)
+                }
+            })?;
+        self.conn.execute("UPDATE roadmap_items SET title=COALESCE(?1,title), description=COALESCE(?2,description), position=COALESCE(?3,position), updated_at=?4 WHERE id=?5", params![title, description, position, now.to_rfc3339(), id])?;
+        self.record_roadmap_event(&goal_id, Some(id), "item_edited", None, None, now)?;
+        self.conn.execute(
+            "UPDATE goals SET updated_at=?1 WHERE id=?2",
+            params![now.to_rfc3339(), goal_id],
+        )?;
+        Ok(())
+    }
+    pub fn delete_roadmap_item(&self, id: &str, now: DateTime<Utc>) -> Result<(), StorageError> {
+        let goal_id: String = self
+            .conn
+            .query_row(
+                "SELECT goal_id FROM roadmap_items WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    StorageError::InvalidRoadmap(format!("item '{}' does not exist", id))
+                } else {
+                    StorageError::Sqlite(e)
+                }
+            })?;
+        let used: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM roadmap_items WHERE goal_id=?1 AND instr(depends_on, ?2) > 0)", params![goal_id, format!("\"{}\"", id)], |r| r.get(0))?;
+        if used {
+            return Err(StorageError::InvalidRoadmap(
+                "cannot delete an item that another item depends on".into(),
+            ));
+        }
+        self.conn
+            .execute("DELETE FROM roadmap_items WHERE id=?1", params![id])?;
+        self.record_roadmap_event(&goal_id, Some(id), "item_deleted", None, None, now)?;
+        self.conn.execute(
+            "UPDATE goals SET status='active',updated_at=?1 WHERE id=?2",
+            params![now.to_rfc3339(), goal_id],
         )?;
         Ok(())
     }
@@ -873,6 +1259,97 @@ mod tests {
 
         store.evict_repo("r1").unwrap();
         assert!(store.get_repo("r1").is_err());
+    }
+
+    #[test]
+    fn roadmap_validates_dependencies_and_advances_position() {
+        let store = get_test_store();
+        let now = Utc::now();
+        store
+            .create_goal(&crate::types::Goal {
+                id: "g".into(),
+                title: "Goal".into(),
+                description: None,
+                status: "active".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let first = crate::types::RoadmapItem {
+            id: "a".into(),
+            goal_id: "g".into(),
+            title: "First".into(),
+            description: None,
+            status: "planned".into(),
+            position: 0,
+            depends_on: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        store.add_roadmap_item(&first).unwrap();
+        let second = crate::types::RoadmapItem {
+            id: "b".into(),
+            goal_id: "g".into(),
+            title: "Second".into(),
+            description: None,
+            status: "planned".into(),
+            position: 0,
+            depends_on: vec!["a".into()],
+            created_at: now,
+            updated_at: now,
+        };
+        store.add_roadmap_item(&second).unwrap();
+        assert_eq!(store.roadmap("g").unwrap().1[1].position, 1);
+        assert!(store.update_roadmap_item("b", "done", now).is_err());
+        store.update_roadmap_item("a", "done", now).unwrap();
+        store.update_roadmap_item("b", "done", now).unwrap();
+        assert_eq!(store.roadmap("g").unwrap().0.status, "completed");
+        let missing = crate::types::RoadmapItem {
+            id: "c".into(),
+            goal_id: "g".into(),
+            title: "Bad".into(),
+            description: None,
+            status: "planned".into(),
+            position: 0,
+            depends_on: vec!["missing".into()],
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(store.add_roadmap_item(&missing).is_err());
+    }
+
+    #[test]
+    fn roadmap_rejects_manual_completion_with_open_items() {
+        let store = get_test_store();
+        let now = Utc::now();
+        store
+            .create_goal(&crate::types::Goal {
+                id: "g2".into(),
+                title: "Goal".into(),
+                description: None,
+                status: "active".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .add_roadmap_item(&crate::types::RoadmapItem {
+                id: "open".into(),
+                goal_id: "g2".into(),
+                title: "Open".into(),
+                description: None,
+                status: "planned".into(),
+                position: 0,
+                depends_on: vec![],
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        assert!(
+            store
+                .update_goal("g2", None, None, Some("completed"), now)
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "fossil-core"
-description = "Shared types, errors, and storage layer for fossil-mcp"
+description = "Shared types, errors, and storage layer for Reforge-MCP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

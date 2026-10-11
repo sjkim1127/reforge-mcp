@@ -1,8 +1,8 @@
-# Releasing fossil-mcp
+# Releasing reforge-mcp
 
 ## 릴리즈 절차 (태그 기반 자동화)
 
-fossil-mcp는 태그를 push하면 GitHub Actions가 5개 플랫폼 바이너리를 자동으로 빌드하고 GitHub Release를 생성합니다.
+reforge-mcp는 태그를 push하면 GitHub Actions가 5개 플랫폼 바이너리를 자동으로 빌드하고 GitHub Release를 생성합니다.
 
 ### 1. 릴리즈 전 체크리스트
 
@@ -40,11 +40,11 @@ git push origin v0.2.0
 
 | 파일 | 플랫폼 |
 |---|---|
-| `fossil-mcp-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | Linux x86\_64 |
-| `fossil-mcp-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 |
-| `fossil-mcp-vX.Y.Z-x86_64-apple-darwin.tar.gz` | macOS Intel |
-| `fossil-mcp-vX.Y.Z-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-| `fossil-mcp-vX.Y.Z-x86_64-pc-windows-msvc.zip` | Windows x86\_64 |
+| `reforge-mcp-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | Linux x86\_64 |
+| `reforge-mcp-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 |
+| `reforge-mcp-vX.Y.Z-x86_64-apple-darwin.tar.gz` | macOS Intel |
+| `reforge-mcp-vX.Y.Z-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `reforge-mcp-vX.Y.Z-x86_64-pc-windows-msvc.zip` | Windows x86\_64 |
 | `SHA256SUMS.txt` | 체크섬 파일 |
 
 ### 4. 릴리즈 노트 자동화
@@ -71,8 +71,8 @@ git push origin v0.1.1
 
 ```bash
 # macOS Apple Silicon 기준
-cargo build --release --locked --bin fossil-mcp
+cargo build --release --locked --bin reforge-mcp
 
 # Linux x86_64 GNU
-cargo build --release --locked --bin fossil-mcp --target x86_64-unknown-linux-gnu
+cargo build --release --locked --bin reforge-mcp --target x86_64-unknown-linux-gnu
 ```

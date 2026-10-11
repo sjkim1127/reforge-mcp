@@ -24,4 +24,7 @@ pub enum StorageError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("invalid roadmap operation: {0}")]
+    InvalidRoadmap(String),
 }

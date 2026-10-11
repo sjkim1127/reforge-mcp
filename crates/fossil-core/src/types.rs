@@ -142,3 +142,37 @@ pub struct SearchResult {
     /// Normalised match score in [0.0, 1.0].
     pub score: f64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Goal {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoadmapItem {
+    pub id: String,
+    pub goal_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub position: i64,
+    pub depends_on: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoadmapEvent {
+    pub id: i64,
+    pub goal_id: String,
+    pub item_id: Option<String>,
+    pub event_type: String,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    pub created_at: DateTime<Utc>,
+}

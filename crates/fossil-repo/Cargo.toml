@@ -1,6 +1,6 @@
 [package]
 name = "fossil-repo"
-description = "Git clone and cache management for fossil-mcp"
+description = "Git clone and cache management for Reforge-MCP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

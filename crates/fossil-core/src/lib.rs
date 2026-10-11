@@ -3,4 +3,7 @@ pub mod storage;
 pub mod types;
 
 pub use error::CoreError;
-pub use types::{CallEdge, RepoMeta, SearchResult, Symbol, SymbolKind, SymbolSource};
+pub use types::{
+    CallEdge, Goal, RepoMeta, RoadmapEvent, RoadmapItem, SearchResult, Symbol, SymbolKind,
+    SymbolSource,
+};

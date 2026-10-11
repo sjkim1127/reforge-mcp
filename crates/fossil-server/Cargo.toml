@@ -1,13 +1,13 @@
 [package]
 name = "fossil-server"
-description = "MCP server entry point for fossil-mcp"
+description = "MCP server entry point for Reforge-MCP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "fossil-mcp"
+name = "reforge-mcp"
 path = "src/main.rs"
 
 [dependencies]

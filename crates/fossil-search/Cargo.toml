@@ -1,6 +1,6 @@
 [package]
 name = "fossil-search"
-description = "Fuzzy symbol search engine for fossil-mcp"
+description = "Fuzzy symbol search engine for Reforge-MCP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

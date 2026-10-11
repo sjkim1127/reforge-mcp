@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: fossil-mcp
+  BINARY_NAME: reforge-mcp
 
 # Permissions needed to create GitHub Releases and upload assets.
 permissions:
@@ -114,11 +114,11 @@ jobs:
         if: matrix.use_cross
         run: |
           mkdir -p "$HOME/.cache/ort.pyke.io"
-          ORT_CACHE_DIR="$HOME/.cache/ort.pyke.io" cross build --release --locked --bin fossil-mcp --target ${{ matrix.target }}
+          ORT_CACHE_DIR="$HOME/.cache/ort.pyke.io" cross build --release --locked --bin reforge-mcp --target ${{ matrix.target }}
 
       - name: Build release binary (cargo)
         if: '!matrix.use_cross'
-        run: cargo build --release --locked --bin fossil-mcp --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin reforge-mcp --target ${{ matrix.target }}
         env:
           ORT_CACHE_DIR: ${{ matrix.ort_cache_path }}
 
@@ -129,11 +129,11 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            echo "path=target/${{ matrix.target }}/release/fossil-mcp.exe" >> "$GITHUB_OUTPUT"
-            echo "name=fossil-mcp.exe" >> "$GITHUB_OUTPUT"
+            echo "path=target/${{ matrix.target }}/release/reforge-mcp.exe" >> "$GITHUB_OUTPUT"
+            echo "name=reforge-mcp.exe" >> "$GITHUB_OUTPUT"
           else
-            echo "path=target/${{ matrix.target }}/release/fossil-mcp" >> "$GITHUB_OUTPUT"
-            echo "name=fossil-mcp" >> "$GITHUB_OUTPUT"
+            echo "path=target/${{ matrix.target }}/release/reforge-mcp" >> "$GITHUB_OUTPUT"
+            echo "name=reforge-mcp" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Determine archive name
@@ -141,7 +141,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ github.ref_name }}"
-          echo "name=fossil-mcp-${VERSION}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          echo "name=reforge-mcp-${VERSION}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
 
       # tar.gz (Unix)
       - name: Package (tar.gz)
@@ -152,6 +152,7 @@ jobs:
           tar -czf "$ARCHIVE" \
             "${{ steps.bin.outputs.name }}" \
             README.md \
+            docs \
             LICENSE
           echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 
@@ -162,7 +163,7 @@ jobs:
         run: |
           $archive = "${{ steps.archive.outputs.name }}.zip"
           Copy-Item "${{ steps.bin.outputs.path }}" "${{ steps.bin.outputs.name }}"
-          Compress-Archive -Path "${{ steps.bin.outputs.name }}", "README.md", "LICENSE" `
+          Compress-Archive -Path "${{ steps.bin.outputs.name }}", "README.md", "docs", "LICENSE" `
                            -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 

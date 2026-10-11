@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to fossil-mcp will be documented in this file.
+All notable changes to Reforge-MCP (formerly Fossil-MCP) will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Releases follow [Semantic Versioning](https://semver.org/).
@@ -10,6 +10,8 @@ Releases follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Rust-porting product design for C, C++, Java, Python, and Go with behavioral verification gates.
+- `get_porting_capabilities` to distinguish implemented source lookup from planned porting features.
 - Semantic search storage through local SQLite vector tables.
 - SCIP index support when `index.scip` is present, with tree-sitter fallback.
 - One-shot `analyze_feature` workflow for clone, index, and search.
@@ -19,6 +21,8 @@ Releases follow [Semantic Versioning](https://semver.org/).
 - Incremental file indexing and workspace watcher tools for local workspaces.
 
 ### Changed
+- Product, stdio server identity, executable, and release archives renamed to `reforge-mcp`; update MCP client command paths.
+- Previous README preserved in `docs/fossil-reference.md`; internal crate names, cache paths, and `FOSSIL_*` variables retained.
 - README now documents the full MCP tool surface and current output contracts.
 - CI product baseline now includes warning-free Clippy checks.
 - Vulnerability scanning now uses named built-in heuristic patterns instead of mock CVE exact matching.
@@ -47,5 +51,5 @@ Releases follow [Semantic Versioning](https://semver.org/).
 - Workspace of 5 crates: `fossil-{core,repo,indexer,search,server}`
 - 17 unit tests across all crates
 
-[Unreleased]: https://github.com/sjkim1127/fossil-mcp/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/sjkim1127/fossil-mcp/releases/tag/v0.1.0
+[Unreleased]: https://github.com/sjkim1127/reforge-mcp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sjkim1127/reforge-mcp/releases/tag/v0.1.0

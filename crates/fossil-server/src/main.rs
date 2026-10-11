@@ -15,12 +15,12 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    tracing::info!("fossil-mcp server starting (stdio transport)");
+    tracing::info!("reforge-mcp server starting (stdio transport)");
 
-    let service = tools::FossilServer::new();
+    let service = tools::ReforgeServer::new();
     let server = service.serve(stdio()).await?;
     server.waiting().await?;
 
-    tracing::info!("fossil-mcp server stopped");
+    tracing::info!("reforge-mcp server stopped");
     Ok(())
 }
