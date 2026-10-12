@@ -173,7 +173,7 @@ impl Engine {
                 "-std=c11".into(),
                 "-pedantic-errors".into(),
                 "-Werror".into(),
-                "-Wno-error=newline-eof".into(),
+                "-Wno-newline-eof".into(),
                 "-Xclang".into(),
                 "-ast-dump=json".into(),
                 "-fsyntax-only".into(),
