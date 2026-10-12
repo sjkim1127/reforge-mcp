@@ -1,8 +1,10 @@
 # Reforge-MCP
 
-C · C++ · Java · Python · Go 프로젝트를 Rust로 자동 포팅하고, 원본과의 동작 비교로 결과를 검증하는 MCP 서버를 목표로 합니다. 기존 프로젝트 이름은 Fossil-MCP입니다.
+**Linux 커널 규모의 시스템 소프트웨어를 Rust로 자동 포팅하는 MCP 기반 분석·생성·검증 인프라**를 목표로 합니다. C 시스템 소프트웨어를 우선하며 C++·Java·Python·Go 확장도 유지합니다. 기존 프로젝트 이름은 Fossil-MCP입니다.
 
 ## 제품 방향
+
+최종 목표는 커널의 빌드 구성·ABI·메모리 수명·동시성·실행 동작을 유지하는 Rust 구현을 자동으로 산출하는 것입니다. 현재 커널 포팅 지원은 구현되지 않았습니다. 작은 함수 변환기는 초기 검증 백엔드이며, 커널 규모의 완료 기준은 [커널 포팅 아키텍처와 로드맵](docs/kernel-scale-roadmap.md)을 따릅니다.
 
 AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록 MCP 서버가 분석 근거, 의존성 순서, 작업 상태, 컴파일 진단, 동작 비교 결과를 제공합니다. 최종 목표는 이 과정을 자동으로 반복하는 포팅 파이프라인입니다.
 
@@ -15,6 +17,8 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 ```
 
 첫 구현은 Clang AST를 읽어 제한된 C 함수를 Rust로 직접 변환하는 생성기입니다. AI 에이전트가 후보를 제출하는 경로도 제공합니다. Joern은 후속 분석 백엔드로 연결할 계획입니다.
+
+다음 우선순위는 **Kbuild/`.config`/compilation database 기반 빌드 컨텍스트 수집 → typed IR → C/Rust 혼합 빌드 및 ABI → 커널 빌드·부팅·시험 worker**입니다. 함수 단위 테스트를 커널 준비도나 전체 시스템 동등성으로 보고하지 않습니다.
 
 ## 현재 구현 상태
 
@@ -96,7 +100,8 @@ python3 scripts/porting_smoke.py
 
 ## 설계와 개발
 
-- [제품 설계 및 단계별 완료 기준](docs/rust-porting-design.md)
+- [커널 규모 포팅 목표와 아키텍처](docs/kernel-scale-roadmap.md)
+- [현재 엔진 설계 및 단계별 완료 기준](docs/rust-porting-design.md)
 - [기존 도구 계약과 운영 참고](docs/fossil-reference.md): 전환 전 문서이며 실행 파일 이름은 위 설정을 따릅니다.
 - [릴리즈 절차](RELEASING.md)
 
