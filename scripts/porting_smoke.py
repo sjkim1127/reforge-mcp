@@ -91,6 +91,25 @@ def main():
         verified = client.tool("verify_port", {"job_id": job_id, "entry_function": "score", "cases": cases})
         assert verified["state"] == "completed", verified
         assert [case["source"]["stdout"].strip() for case in verified["verifications"][-1]["cases"]] == ["199", "201", "17", "-1", "15", "210"]
+        def run_fixture(name, function, fixture_cases):
+            fixture = client.tool("analyze_porting_project", {"source_path": str(ROOT / "fixtures/porting" / name)})
+            assert fixture["state"] == "analyzed", fixture
+            args = {"job_id": fixture["job_id"]}
+            client.tool("create_porting_plan", args)
+            client.tool("generate_rust", args)
+            result = client.tool("verify_port", dict(args, entry_function=function, cases=fixture_cases))
+            assert result["state"] == "completed", result
+            (data / (name + "-report.json")).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return result
+
+        headers = run_fixture("headers", "evaluate", [[-100], [-40], [0], [17], [40], [100]])
+        assert len(headers["functions"]) == 3
+        assert headers["header_dependencies"]
+        real = run_fixture("musl-abs", "abs", [[0], [1], [-1], [-65536], [2147483647], [-2147483647]])
+        assert len(real["functions"]) == 1
+        undefined = client.tool("verify_port", {"job_id": real["job_id"], "entry_function": "abs", "cases": [[-2147483648]]})
+        assert undefined["state"] == "blocked"
+        assert undefined["verifications"][-1]["status"] == "source_failed"
         blocked = client.tool("analyze_porting_project", {"source_path": str(ROOT / "fixtures/porting/unsupported")})
         assert blocked["state"] == "blocked" and blocked["unsupported"]
     finally:
@@ -102,7 +121,10 @@ def main():
         assert any(item["job_id"] == job_id for item in resumed.tool("list_porting_jobs", {})["jobs"])
         output = data / "report.json"
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps({"job_id": job_id, "state": report["state"], "matched_cases": len(cases), "restart_resume": True, "unsupported_pointer": "blocked", "report": str(output)}, ensure_ascii=False))
+        print(json.dumps({"job_id": job_id, "state": report["state"], "matched_cases": len(cases), "restart_resume": True, "unsupported_pointer": "blocked",
+                    "header_cases": 6,
+                    "musl_abs_cases": 6,
+                    "musl_abs_int_min": "blocked", "report": str(output)}, ensure_ascii=False))
     finally:
         resumed.close()
 

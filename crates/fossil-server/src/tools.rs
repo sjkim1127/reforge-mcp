@@ -198,7 +198,7 @@ pub struct EditRoadmapItemInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PortingProjectInput {
     #[schemars(
-        description = "Local source directory containing at most 32 C files and 256 KiB of C source. No headers or preprocessor directives in this version."
+        description = "Local source directory containing at most 32 C/header files and 256 KiB of project source. Clang expands includes/macros; headers and external include dependencies are hashed."
     )]
     pub source_path: String,
 }
@@ -269,6 +269,8 @@ impl ReforgeServer {
                 "source_lookup": true,
                 "persistent_roadmaps": true,
                 "persistent_porting_jobs": true,
+                "c_preprocessing": true,
+                "header_dependency_hashes": true,
                 "rust_generation": "deterministic_clang_ast_int32_subset",
                 "behavioral_verification": "fixture_level_library_functions"
             },
@@ -279,7 +281,7 @@ impl ReforgeServer {
             },
             "porting_workflow": ["analyze_porting_project", "create_porting_plan", "get_porting_context", "generate_rust", "submit_rust_candidate", "verify_port", "get_porting_report", "list_porting_jobs"],
             "requirements": ["clang with UBSan", "rustc", "cargo"],
-            "supported_c": "int32 library functions, arithmetic, comparisons, branches, initialized locals, direct internal calls; no main, headers, preprocessor, pointers, globals, loops, or external dependencies",
+            "supported_c": "int32 library functions, arithmetic, comparisons, branches, initialized locals, direct internal calls, include guards, macros, conditional compilation, and int-only header prototypes/shared inline functions; no main, pointers, globals, loops, or external function calls",
             "execution": "local host with time/output limits; not an OS security sandbox",
             "verification_policy": "Completion means the submitted entry-function fixtures passed on the pinned source and candidate; not whole-program equivalence. Undefined behavior in source cases blocks acceptance."
         }).to_string())

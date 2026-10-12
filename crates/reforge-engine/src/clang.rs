@@ -2,6 +2,7 @@
 use anyhow::{Result, bail, ensure};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use crate::model::Function;
 
@@ -31,21 +32,42 @@ fn identifier(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn translate(ast: &Value, file: &str, source: &str) -> Result<Vec<Function>> {
+pub fn translate(ast: &Value, translation_unit: &Path, root: &Path) -> Result<Vec<Function>> {
     ensure!(
         kind(ast) == "TranslationUnitDecl",
         "unexpected Clang AST root"
     );
     let mut functions = Vec::new();
+    let mut current_file = translation_unit.to_path_buf();
     for node in children(ast) {
         if node["isImplicit"].as_bool() == Some(true) {
             continue;
         }
+        let location = expansion_location(&node["loc"]);
+        if let Some(file) = location["file"].as_str() {
+            current_file = Path::new(file).to_path_buf();
+        }
+        // Clang elides repeated filenames in JSON. Track that context and never
+        // confuse declarations from system headers with the source translation unit.
+        let physical_file = current_file.canonicalize()?;
+        if !physical_file.starts_with(root) {
+            continue;
+        }
+        let file = physical_file
+            .strip_prefix(root)?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 source path"))?;
+        let source = std::fs::read_to_string(&physical_file)?;
         ensure!(
             kind(node) == "FunctionDecl",
             "unsupported top-level {}",
             kind(node)
         );
+        let Some(body) = children(node).iter().find(|n| kind(n) == "CompoundStmt") else {
+            // Prototypes are compile-checked by Clang; external calls are rejected
+            // against the final project definition inventory.
+            continue;
+        };
         let name = text(node, "name");
         identifier(name)?;
         ensure!(
@@ -76,12 +98,12 @@ pub fn translate(ast: &Value, file: &str, source: &str) -> Result<Vec<Function>>
         ensure!(
             children(node)
                 .iter()
-                .all(|n| matches!(kind(n), "ParmVarDecl" | "CompoundStmt")),
+                .all(|n| matches!(kind(n), "ParmVarDecl" | "CompoundStmt")
+                    || (matches!(kind(n), "BuiltinAttr" | "NoThrowAttr" | "ConstAttr")
+                        && (n["inherited"].as_bool() == Some(true)
+                            || n["implicit"].as_bool() == Some(true)))),
             "function attributes or other declarations are unsupported"
         );
-        let Some(body) = children(node).iter().find(|n| kind(n) == "CompoundStmt") else {
-            continue;
-        };
         let mut emitter = Emitter {
             variables: BTreeMap::new(),
             dependencies: BTreeSet::new(),
@@ -106,6 +128,7 @@ pub fn translate(ast: &Value, file: &str, source: &str) -> Result<Vec<Function>>
             signature.join(", ")
         );
         let line = |loc: &Value| -> Result<usize> {
+            let loc = expansion_location(loc);
             let offset = loc["offset"]
                 .as_u64()
                 .ok_or_else(|| anyhow::anyhow!("missing source offset"))?
@@ -126,11 +149,15 @@ pub fn translate(ast: &Value, file: &str, source: &str) -> Result<Vec<Function>>
             rust,
         });
     }
-    ensure!(
-        !functions.is_empty(),
-        "translation unit has no supported function definitions"
-    );
     Ok(functions)
+}
+
+fn expansion_location(location: &Value) -> &Value {
+    if location.get("expansionLoc").is_some() {
+        &location["expansionLoc"]
+    } else {
+        location
+    }
 }
 
 struct Emitter {

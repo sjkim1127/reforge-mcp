@@ -7,6 +7,13 @@ pub struct SourceFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderDependency {
+    pub path: String,
+    pub sha256: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
     pub parameters: Vec<String>,
@@ -87,6 +94,8 @@ pub struct Job {
     pub state: String,
     pub source_snapshot_sha256: String,
     pub source_files: Vec<SourceFile>,
+    #[serde(default)]
+    pub header_dependencies: Vec<HeaderDependency>,
     pub functions: Vec<Function>,
     pub unsupported: Vec<Diagnostic>,
     pub analysis_commands: Vec<CommandRun>,

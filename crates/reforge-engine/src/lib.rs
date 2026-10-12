@@ -1,5 +1,6 @@
 //! A persistent, bounded C-to-Rust vertical slice, independent of code-search infrastructure.
 mod clang;
+mod dependencies;
 pub mod model;
 mod process;
 mod store;
@@ -14,7 +15,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use model::{CaseResult, Diagnostic, Function, Job, SourceFile, Verification};
+use model::{CaseResult, Diagnostic, Function, HeaderDependency, Job, SourceFile, Verification};
 use store::Store;
 
 const MAX_FILES: usize = 32;
@@ -94,13 +95,14 @@ impl Engine {
         let snapshot = dir.join("source");
         std::fs::create_dir_all(&snapshot)?;
         let mut job = Job {
-            schema_version: 1,
+            schema_version: 2,
             job_id: id,
             source_path: source.display().to_string(),
             artifact_path: dir.display().to_string(),
             state: "analyzing".into(),
             source_snapshot_sha256: String::new(),
             source_files: Vec::new(),
+            header_dependencies: Vec::new(),
             functions: Vec::new(),
             unsupported: Vec::new(),
             analysis_commands: Vec::new(),
@@ -160,17 +162,20 @@ impl Engine {
         job.analysis_commands.push(version);
         for (i, file) in job.source_files.iter().enumerate() {
             let path = dir.join("source").join(&file.path);
-            let source = std::fs::read_to_string(&path)?;
-            if file.path.ends_with(".h")
-                || source
-                    .lines()
-                    .any(|line| line.trim_start().starts_with('#'))
-            {
-                job.unsupported.push(Diagnostic { file:file.path.clone(), message:"Headers and preprocessor directives are outside the initial supported subset".into() });
+            if file.path.ends_with(".h") {
                 continue;
             }
+            let dependency_path = logs.join(format!("ast-{i}.d"));
             let args = vec![
                 "-std=c11".into(),
+                "-fno-builtin".into(),
+                "-I".into(),
+                dir.join("source").display().to_string(),
+                "-MD".into(),
+                "-MF".into(),
+                dependency_path.display().to_string(),
+                "-MT".into(),
+                "reforge".into(),
                 "-pedantic-errors".into(),
                 "-Werror".into(),
                 "-Wno-newline-eof".into(),
@@ -183,12 +188,56 @@ impl Engine {
                 process::run("clang", &args, &dir, &logs, &format!("ast-{i}"), 30).await?;
             let translated = if run.success() {
                 let ast = serde_json::from_str(&run.stdout)?;
-                clang::translate(&ast, &file.path, &source)
+                clang::translate(&ast, &path, &dir.join("source"))
             } else {
                 Err(anyhow::anyhow!("Clang analysis failed: {}", run.stderr))
             };
             match translated {
-                Ok(functions) => job.functions.extend(functions),
+                Ok(functions) => {
+                    let parsed = dependencies::parse(&std::fs::read_to_string(&dependency_path)?)?;
+                    for dependency in parsed {
+                        let path = if dependency.is_absolute() {
+                            dependency
+                        } else {
+                            dir.join(dependency)
+                        }
+                        .canonicalize()?;
+                        let name = path.display().to_string();
+                        if job.header_dependencies.iter().any(|d| d.path == name) {
+                            continue;
+                        }
+                        ensure!(
+                            job.header_dependencies.len() < 512,
+                            "include dependency count exceeds 512"
+                        );
+                        ensure!(
+                            std::fs::metadata(&path)?.len() <= 4 * 1024 * 1024,
+                            "include dependency exceeds 4 MiB"
+                        );
+                        job.header_dependencies.push(HeaderDependency {
+                            path: name,
+                            sha256: hash(&std::fs::read(&path)?),
+                            kind: if path.starts_with(dir.join("source")) {
+                                "project"
+                            } else {
+                                "external"
+                            }
+                            .into(),
+                        });
+                    }
+                    for function in functions {
+                        if job.functions.iter().any(|other| {
+                            other.name == function.name
+                                && other.source_file == function.source_file
+                                && other.line_start == function.line_start
+                                && other.line_end == function.line_end
+                                && other.rust == function.rust
+                        }) {
+                            continue;
+                        }
+                        job.functions.push(function);
+                    }
+                }
                 Err(error) => job.unsupported.push(Diagnostic {
                     file: file.path.clone(),
                     message: error.to_string(),
@@ -196,6 +245,12 @@ impl Engine {
             }
             run.compact();
             job.analysis_commands.push(run);
+        }
+        if job.functions.is_empty() {
+            job.unsupported.push(Diagnostic {
+                file: String::new(),
+                message: "no supported function definitions found".into(),
+            });
         }
         let mut names = BTreeSet::new();
         for function in &job.functions {
@@ -219,6 +274,15 @@ impl Engine {
                 }
             }
         }
+        let mut external_headers: Vec<_> = job
+            .header_dependencies
+            .iter()
+            .filter(|d| d.kind == "external")
+            .collect();
+        external_headers.sort_by(|a, b| a.path.cmp(&b.path));
+        job.source_snapshot_sha256 = hash(&serde_json::to_vec(
+            &json!({"project_files":job.source_files,"external_headers":external_headers}),
+        )?);
         job.analysis_complete = true;
         job.state = if job.unsupported.is_empty() {
             "analyzed"
@@ -261,7 +325,7 @@ impl Engine {
                 .join(&function.source_file),
         )?;
         Ok(
-            json!({"job_id":id,"function":function,"translation_unit_source":source,"source_sha256":job.source_snapshot_sha256,"unsupported":job.unsupported,"semantics":"32-bit signed int; checked arithmetic; no external calls, global state, pointers, loops, headers, or preprocessor directives"}),
+            json!({"job_id":id,"function":function,"translation_unit_source":source,"source_sha256":job.source_snapshot_sha256,"unsupported":job.unsupported,"semantics":"32-bit signed int; checked arithmetic; no external calls, global state, pointers, or loops; macros expanded by Clang; include dependencies are hashed"}),
         )
     }
     pub fn generate(&self, id: &str) -> Result<Job> {
@@ -316,6 +380,13 @@ impl Engine {
         self.store.save(job)
     }
     fn fresh_source(&self, job: &Job) -> Result<()> {
+        for dependency in &job.header_dependencies {
+            ensure!(
+                hash(&std::fs::read(&dependency.path)?) == dependency.sha256,
+                "include dependency changed: {}; reanalyze project",
+                dependency.path
+            );
+        }
         let original = Path::new(&job.source_path);
         let files = source_files(original)?;
         ensure!(
@@ -480,6 +551,13 @@ impl Engine {
         let mut args = vec![
             "-std=c11".into(),
             "-O0".into(),
+            "-fno-builtin".into(),
+            "-I".into(),
+            self.store
+                .directory(&job.job_id)?
+                .join("source")
+                .display()
+                .to_string(),
             "-fsanitize=undefined".into(),
             "-fno-sanitize-recover=all".into(),
         ];
@@ -487,6 +565,7 @@ impl Engine {
         args.extend(
             job.source_files
                 .iter()
+                .filter(|f| f.path.ends_with(".c"))
                 .map(|f| snapshot.join(&f.path).display().to_string()),
         );
         args.extend([

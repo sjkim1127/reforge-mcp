@@ -10,6 +10,8 @@ Releases follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Clang include/macro preprocessing with original header source mapping, shared inline-function deduplication, and include-dependency hash invalidation.
+- Pinned, unchanged musl `abs.c` fixture with upstream license/provenance and UB boundary checks.
 - Independent `reforge-engine` with Clang AST C int32 analysis and deterministic Rust Cargo generation.
 - Persistent porting jobs, dependency plans, agent candidate submission, hash invalidation, and append-only events.
 - UBSan-backed original/Rust differential verification with bounded processes and retained build/case evidence.

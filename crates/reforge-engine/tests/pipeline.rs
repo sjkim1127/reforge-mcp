@@ -138,7 +138,6 @@ async fn rejects_unsupported_semantics_and_external_calls() {
         "unsigned f(unsigned a) { return a+1; }",
         "int global=1; int f(int x) { return x+global; }",
         "int f(int x) { while(x>0) x=x-1; return x; }",
-        "#define ONE 1\nint f(int x) { return x+ONE; }",
         "int external(int); int f(int x) { return external(x); }",
         "int f(int x) { int value; return value+x; }",
         "int f(int x) { static int count=1; return x+count; }",
@@ -421,4 +420,159 @@ async fn signed_division_remainder_bits_and_zero_argument_entries_match() {
             .stdout,
         "42\n"
     );
+}
+
+#[tokio::test]
+async fn headers_macros_and_shared_inline_functions_keep_correct_provenance() {
+    let workspace = Workspace::new();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/porting/headers");
+    for file in ["api.h", "scale.c", "evaluate.c"] {
+        std::fs::copy(fixtures.join(file), workspace.source.join(file)).unwrap();
+    }
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert_eq!(job.functions.len(), 3);
+    let header = job.functions.iter().find(|f| f.name == "bounded").unwrap();
+    assert_eq!(header.source_file, "api.h");
+    assert_eq!(header.line_start, 6);
+    assert_eq!(header.line_end, 10);
+    assert!(job.header_dependencies.iter().any(|d| d.kind == "external"));
+    assert!(
+        job.header_dependencies
+            .iter()
+            .any(|d| d.path.ends_with("api.h"))
+    );
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let result = engine
+        .verify(
+            &job.job_id,
+            "evaluate",
+            vec![
+                vec![-100],
+                vec![-40],
+                vec![0],
+                vec![17],
+                vec![40],
+                vec![100],
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.state, "completed", "{}", describe(&result));
+    assert_eq!(
+        result.verifications[0]
+            .cases
+            .iter()
+            .map(|c| c.source.stdout.trim())
+            .collect::<Vec<_>>(),
+        vec!["-160", "-160", "0", "68", "160", "160"]
+    );
+    workspace.write("api.h", "#define SCALE 5\n");
+    assert_eq!(engine.report(&job.job_id).unwrap().state, "stale");
+}
+
+#[tokio::test]
+async fn pinned_real_musl_abs_compiles_matches_and_rejects_undefined_boundary() {
+    let workspace = Workspace::new();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/porting/musl-abs/abs.c");
+    std::fs::copy(fixture, workspace.source.join("abs.c")).unwrap();
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert_eq!(job.functions.len(), 1);
+    assert_eq!(job.functions[0].source_file, "abs.c");
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let good = engine
+        .verify(
+            &job.job_id,
+            "abs",
+            vec![
+                vec![0],
+                vec![1],
+                vec![-1],
+                vec![-65536],
+                vec![i32::MAX],
+                vec![i32::MIN + 1],
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(good.state, "completed", "{}", describe(&good));
+    assert_eq!(
+        good.verifications[0]
+            .cases
+            .iter()
+            .map(|c| c.source.stdout.trim())
+            .collect::<Vec<_>>(),
+        vec!["0", "1", "1", "65536", "2147483647", "2147483647"]
+    );
+    let ub = engine
+        .verify(&job.job_id, "abs", vec![vec![i32::MIN]])
+        .await
+        .unwrap();
+    assert_eq!(ub.state, "blocked", "{}", describe(&ub));
+    assert_eq!(ub.verifications.last().unwrap().status, "source_failed");
+}
+
+#[tokio::test]
+async fn external_header_drift_invalidates_a_verified_job() {
+    let workspace = Workspace::new();
+    let external = workspace._temp.path().join("external.h");
+    std::fs::write(&external, "#define FACTOR 2\n").unwrap();
+    workspace.write(
+        "input.c",
+        &format!(
+            "#include \"{}\"\nint f(int x) {{ return x*FACTOR; }}",
+            external.display()
+        ),
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert!(job.header_dependencies.iter().any(|d| d.path
+        == external.canonicalize().unwrap().display().to_string()
+        && d.kind == "external"));
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    assert_eq!(
+        engine
+            .verify(&job.job_id, "f", vec![vec![7]])
+            .await
+            .unwrap()
+            .state,
+        "completed"
+    );
+    std::fs::write(external, "#define FACTOR 3\n").unwrap();
+    assert_eq!(engine.report(&job.job_id).unwrap().state, "stale");
+    let changed = engine.analyze(&workspace.source).await.unwrap();
+    assert_ne!(job.source_snapshot_sha256, changed.source_snapshot_sha256);
+}
+
+#[tokio::test]
+async fn escaped_header_paths_and_missing_final_newline_preserve_source_bytes() {
+    let workspace = Workspace::new();
+    workspace.write("api #$.h", "#define FACTOR 4\n");
+    let contents = "#include \"api #$.h\"\nint f(int x) { return x*FACTOR; }";
+    workspace.write("input.c", contents);
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    let snapshot = Path::new(&job.artifact_path).join("source/input.c");
+    assert_eq!(std::fs::read_to_string(snapshot).unwrap(), contents);
+    assert!(
+        job.header_dependencies
+            .iter()
+            .any(|d| d.path.ends_with("api #$.h"))
+    );
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let result = engine
+        .verify(&job.job_id, "f", vec![vec![-3], vec![0], vec![5]])
+        .await
+        .unwrap();
+    assert_eq!(result.state, "completed", "{}", describe(&result));
 }
