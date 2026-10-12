@@ -26,3 +26,9 @@ release_notes*.md
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .fastembed_cache/
+
+# Persistent local porting smoke artifacts
+.reforge-demo/
+
+# Python smoke client imports
+__pycache__/
