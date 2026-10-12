@@ -1,4 +1,5 @@
 //! A persistent, bounded C-to-Rust vertical slice, independent of code-search infrastructure.
+pub mod campaign;
 mod clang;
 mod dependencies;
 pub mod model;

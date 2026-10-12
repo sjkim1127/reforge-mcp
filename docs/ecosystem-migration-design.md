@@ -8,7 +8,7 @@ C, C++, Java, Python, Go로 작성된 프로그램, 라이브러리, 프레임�
 
 프로그램 및 여러 프로젝트로 구성된 의존 그래프의 크기를 하나의 프롬프트/메모리 작업에 맞추지 않는다. 캠페인→프로젝트/의존 프로젝트→모듈→분석/변환 단위 계층, 디스크 기반 그래프, 페이지 단위 MCP 조회, 증분 분석, 분산 실행 worker와 checkpoint로 처리한다. 자원/시도 예산은 개별 작업에 적용하며 미실행 단위를 전체 성공으로 집계하지 않는다. 현 엔진의 32파일/256 KiB 제한은 초기 scalar-C 백엔드의 한도이고, 큰 프로젝트 지원을 선언하기 위해 단순히 그 제한만 해제하지 않는다.
 
-최종 목표는 원본의 명시된 인터페이스, 기능, 데이터 형식, 오류 처리 및 실행 계약을 유지하는 Rust 산출물이다. 모든 임의 프로그램의 완전 자동 포팅은 아직 달성되지 않은 제품·연구 목표다. 현재 실행 가능한 구현은 README에 적힌 제한된 C 백엔드다.
+최종 목표는 원본의 명시된 인터페이스, 기능, 데이터 형식, 오류 처리 및 실행 계약을 유지하는 Rust 산출물이다. 모든 임의 프로그램의 완전 자동 포팅은 아직 달성되지 않은 제품·연구 목표다. 현재 실행 가능한 구현은 README에 적힌 제한된 C 백엔드와 캠페인·의존성 계약 검증 기반이다.
 
 ## 기계적 변환과 의존 생태계 이전
 
@@ -55,7 +55,7 @@ C, C++, Java, Python, Go로 작성된 프로그램, 라이브러리, 프레임�
   → 검증된 산출물 + 원본 대응표 + 잔여 의존성과 한계
 ```
 
-계획된 MCP 계약은 `inventory_project`, `get_dependency_requirements`, `record_dependency_candidate`, `plan_dependency_adapter`, `verify_dependency_replacement`, `next_migration_tasks`다. 이 도구들은 아직 구현되지 않았다. 기존 `generate_rust`, `submit_rust_candidate`, `verify_port`는 현재 C 백엔드의 구현이며 새 캠페인/의존성 모델에 연결할 대상이다.
+캠페인 기반 MCP 계약인 `inventory_project`, `get_dependency_requirements`, `record_dependency_candidate`, `plan_dependency_adapter`, `verify_dependency_replacement`, `next_migration_tasks`를 구현했다. 등록/수정/소스 조회/하위 캠페인 API와 실행 한계는 [현재 캠페인 가이드](migration-campaigns.md)에 기록한다. 파일/manifest 발견과 Agent 제출 정보, 준비된 실행 파일의 계약 검증을 제공하며 자동 package resolution·registry 검색·어댑터 생성·전체 프로그램 변환은 구현 전이다. 기존 `generate_rust`, `submit_rust_candidate`, `verify_port`는 현재 C 백엔드의 구현이며 새 캠페인/의존성 모델에 연결할 대상이다.
 
 ## 대표 대상별 프로파일
 
@@ -75,11 +75,11 @@ Ghidra는 여러 분석 기능과 Java/Python 확장을 제공하는 도구이�
 - [Spring IoC container](https://docs.spring.io/spring-framework/reference/core/beans.html)
 - [시스템/커널 전용 프로파일](kernel-scale-roadmap.md)
 
-## 다음 기반 구현
+## 후속 기반 구현
 
-1. **Migration campaign 및 인벤토리**: 여러 프로젝트/언어/빌드 생태계를 하나의 작업 그래프로 관리. CMake/Kbuild/compilation database, Maven/Gradle, Python/Go 등의 수집기를 교체 가능한 어댑터로 설계.
+1. **캠페인 인벤토리의 빌드/패키지 해석 확장**: 여러 프로젝트/언어/빌드 생태계를 하나의 작업 그래프로 관리. CMake/Kbuild/compilation database, Maven/Gradle, Python/Go 등의 수집기를 교체 가능한 어댑터로 설계.
 2. **공통 타입/동작 모델과 백엔드**: 기존 `Function.rust`에 결합된 분석과 생성을 분리. native, JVM 기반 앱, 서버/프레임워크를 각각의 런타임 계약과 출력 어댑터로 처리.
-3. **의존성 티켓·후보·어댑터·검증 수명주기**: Agent가 검색해 얻은 후보를 조사 근거와 함께 제출하고, 실제 사용하는 API 범위의 계약 테스트와 연결. 맞는 후보가 없으면 의존 프로젝트 포팅으로 재귀적으로 연결.
+3. **의존성 수명주기의 자동 탐색·구현 연계**: Agent가 검색해 얻은 후보를 조사 근거와 함께 제출하고, 실제 사용하는 API 범위의 계약 테스트와 연결. 맞는 후보가 없으면 의존 프로젝트 포팅으로 재귀적으로 연결.
 4. **프로파일별 실행 worker와 자동 반복**: 빌드/원본 실행 환경, 검증 fixture, 후보/환경 fingerprint, 실패 진단, 예산과 checkpoint를 연결.
 
 진행률은 원본 구현 이전, 라이브러리 직접 대체, adapter/reimplementation, FFI 잔여, unresolved dependency, 미검증 기능/설정의 분모를 유지해 보고한다. 원본 C/JVM에 위임한 기능이나 미실행 테스트를 Rust 구현 완료로 포함하지 않는다.

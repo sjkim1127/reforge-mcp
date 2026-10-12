@@ -92,6 +92,9 @@ jobs:
       - name: Probe real MCP porting and restart resumption
         run: python3 scripts/porting_smoke.py
 
+      - name: Probe migration campaigns and dependency contracts
+        run: python3 scripts/campaign_smoke.py
+
       - name: Upload porting evidence
         if: always()
         uses: actions/upload-artifact@v4

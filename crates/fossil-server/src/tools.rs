@@ -225,6 +225,62 @@ pub struct VerifyPortInput {
     )]
     pub cases: Vec<Vec<i32>>,
 }
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InventoryProjectInput {
+    pub name: String,
+    pub source_path: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CampaignPageInput {
+    pub campaign_id: String,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CampaignContextInput {
+    pub campaign_id: String,
+    pub file_path: String,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CampaignIdInput {
+    pub campaign_id: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RegisterRequirementInput {
+    pub campaign_id: String,
+    pub requirement: reforge_engine::campaign::model::RequirementSpec,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviseRequirementInput {
+    pub requirement_id: String,
+    pub requirement: reforge_engine::campaign::model::RequirementSpec,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecordCandidateInput {
+    pub requirement_id: String,
+    pub candidate: reforge_engine::campaign::model::CandidateSpec,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChildCampaignInput {
+    pub requirement_id: String,
+    pub name: String,
+    pub source_path: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VerifyDependencyInput {
+    pub candidate_id: String,
+    pub probes: Vec<reforge_engine::campaign::model::ContractProbe>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CandidateIdInput {
+    pub candidate_id: String,
+}
+fn campaign_service() -> Result<reforge_engine::campaign::CampaignService, McpError> {
+    reforge_engine::campaign::CampaignService::from_env().map_err(porting_error)
+}
+
 fn porting_error(error: anyhow::Error) -> McpError {
     McpError::internal_error(format!("{error:#}"), None)
 }
@@ -251,6 +307,174 @@ impl ReforgeServer {
 #[tool_router]
 impl ReforgeServer {
     #[tool(
+        description = "Create a persistent migration campaign by inventorying source files, languages and build manifests. Hashes files and discovers manifests; does not resolve packages, infer API uses, compile code, or translate Java/Python/Go. Data directory must be outside the source tree."
+    )]
+    async fn inventory_project(
+        &self,
+        Parameters(i): Parameters<InventoryProjectInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            campaign_service()?
+                .inventory_project(&i.name, std::path::Path::new(&i.source_path))
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+    #[tool(
+        description = "Read a campaign's pinned inventory with pagination (1-100 files), checking current source freshness. Returns explicit exclusions and limitations."
+    )]
+    async fn get_migration_inventory(
+        &self,
+        Parameters(i): Parameters<CampaignPageInput>,
+    ) -> Result<String, McpError> {
+        Ok(campaign_service()?
+            .get_inventory(&i.campaign_id, i.offset.unwrap_or(0), i.limit.unwrap_or(50))
+            .map_err(porting_error)?
+            .to_string())
+    }
+    #[tool(
+        description = "Read a bounded byte slice (max 64 KiB) of a file registered in a fresh migration inventory. Supports agent inspection of build manifests and actual source usage."
+    )]
+    async fn get_migration_source_context(
+        &self,
+        Parameters(i): Parameters<CampaignContextInput>,
+    ) -> Result<String, McpError> {
+        Ok(campaign_service()?
+            .get_source_context(
+                &i.campaign_id,
+                &i.file_path,
+                i.offset.unwrap_or(0),
+                i.limit.unwrap_or(16384),
+            )
+            .map_err(porting_error)?
+            .to_string())
+    }
+    #[tool(
+        description = "Register agent-authored source dependency identity, used APIs with actual source line references, unknown usage and mandatory behavior contracts. Registration is not verification or package resolution."
+    )]
+    async fn register_dependency_requirements(
+        &self,
+        Parameters(i): Parameters<RegisterRequirementInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            campaign_service()?
+                .register_requirement(&i.campaign_id, i.requirement)
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+    #[tool(
+        description = "Revise a requirement contract or close unknown-usage gaps; increments its fingerprint/revision and invalidates previous acceptance evidence."
+    )]
+    async fn revise_dependency_requirements(
+        &self,
+        Parameters(i): Parameters<ReviseRequirementInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            campaign_service()?
+                .revise_requirement(&i.requirement_id, i.requirement)
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+    #[tool(
+        description = "Record an agent-researched Rust replacement candidate, pinned metadata, API mapping, gaps and adapter tasks. Source tree must be separate and contain Rust. URLs are retained research assertions; server does not search registries or authenticate metadata."
+    )]
+    async fn record_dependency_candidate(
+        &self,
+        Parameters(i): Parameters<RecordCandidateInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            campaign_service()?
+                .record_candidate(&i.requirement_id, i.candidate)
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+    #[tool(
+        description = "Persist an adapter plan from an agent candidate and actual source requirements. Reports unmapped APIs, known gaps, required contracts, and next actions; does not write adapter code or grant acceptance."
+    )]
+    async fn plan_dependency_adapter(
+        &self,
+        Parameters(i): Parameters<CandidateIdInput>,
+    ) -> Result<String, McpError> {
+        Ok(campaign_service()?
+            .plan_adapter(&i.candidate_id)
+            .map_err(porting_error)?
+            .to_string())
+    }
+
+    #[tool(
+        description = "Create a linked child migration campaign for porting a source dependency itself. Reject ancestor source cycles and depth above 32; this links work, not automatic dependency translation."
+    )]
+    async fn create_dependency_campaign(
+        &self,
+        Parameters(i): Parameters<ChildCampaignInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            campaign_service()?
+                .create_dependency_campaign(
+                    &i.requirement_id,
+                    &i.name,
+                    std::path::Path::new(&i.source_path)
+                )
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+    #[tool(
+        description = "Read paginated dependency requirements and candidate evidence. Rechecks source/replacement/executable freshness. Interrupted attempts and stale contract revisions do not establish acceptance."
+    )]
+    async fn get_dependency_requirements(
+        &self,
+        Parameters(i): Parameters<CampaignPageInput>,
+    ) -> Result<String, McpError> {
+        Ok(campaign_service()?
+            .get_requirements(&i.campaign_id, i.offset.unwrap_or(0), i.limit.unwrap_or(50))
+            .map_err(porting_error)?
+            .to_string())
+    }
+    #[tool(
+        description = "Run agent-prepared source and Rust candidate executables/launchers on explicit fixture argv and compare JSON observations, stderr and exit status. Absolute executables must reside inside their respective pinned project roots. All mandatory contracts need cases; unknown usage or known gaps blocks acceptance. Local host, bounded processes, not a sandbox. Does not compile probes or prove whole-program equivalence."
+    )]
+    async fn verify_dependency_replacement(
+        &self,
+        Parameters(i): Parameters<VerifyDependencyInput>,
+    ) -> Result<String, McpError> {
+        Ok(json!(
+            campaign_service()?
+                .verify(&i.candidate_id, i.probes)
+                .await
+                .map_err(porting_error)?
+        )
+        .to_string())
+    }
+    #[tool(
+        description = "Return paginated agent actions and search queries for unresolved dependency requirements, adapter work or child campaigns. Does not itself search the Internet or invoke an agent."
+    )]
+    async fn next_migration_tasks(
+        &self,
+        Parameters(i): Parameters<CampaignPageInput>,
+    ) -> Result<String, McpError> {
+        Ok(campaign_service()?
+            .next_tasks(&i.campaign_id, i.offset.unwrap_or(0), i.limit.unwrap_or(50))
+            .map_err(porting_error)?
+            .to_string())
+    }
+    #[tool(
+        description = "Read campaign metadata, source freshness, requirement/event counts and scope. Dependency fixtures are reported separately; campaign never claims whole-program migration completed."
+    )]
+    async fn get_migration_campaign(
+        &self,
+        Parameters(i): Parameters<CampaignIdInput>,
+    ) -> Result<String, McpError> {
+        Ok(campaign_service()?
+            .report(&i.campaign_id)
+            .map_err(porting_error)?
+            .to_string())
+    }
+
+    #[tool(
         description = "Report implemented Rust porting capabilities and explicit limitations. Does not probe installed compilers."
     )]
     async fn get_porting_capabilities(
@@ -269,6 +493,12 @@ impl ReforgeServer {
                 "source_lookup": true,
                 "persistent_roadmaps": true,
                 "persistent_porting_jobs": true,
+                "migration_campaigns": true,
+                "manifest_discovery": true,
+                "agent_authored_dependency_tickets": true,
+                "dependency_contract_probes": true,
+                "registry_search": false,
+                "automatic_manifest_dependency_resolution": false,
                 "c_preprocessing": true,
                 "header_dependency_hashes": true,
                 "rust_generation": "deterministic_clang_ast_int32_subset",
@@ -280,6 +510,7 @@ impl ReforgeServer {
                 "joern": "planned_not_integrated"
             },
             "porting_workflow": ["analyze_porting_project", "create_porting_plan", "get_porting_context", "generate_rust", "submit_rust_candidate", "verify_port", "get_porting_report", "list_porting_jobs"],
+            "campaign_workflow": ["inventory_project", "get_migration_inventory", "get_migration_source_context", "register_dependency_requirements", "record_dependency_candidate", "plan_dependency_adapter", "create_dependency_campaign", "get_dependency_requirements", "verify_dependency_replacement", "revise_dependency_requirements", "next_migration_tasks", "get_migration_campaign"],
             "requirements": ["clang with UBSan", "rustc", "cargo"],
             "supported_c": "int32 library functions, arithmetic, comparisons, branches, initialized locals, direct internal calls, include guards, macros, conditional compilation, and int-only header prototypes/shared inline functions; no main, pointers, globals, loops, or external function calls",
             "execution": "local host with time/output limits; not an OS security sandbox",
@@ -1493,7 +1724,7 @@ impl ReforgeServer {
 #[tool_handler(
     name = "reforge-mcp",
     version = "0.1.0",
-    instructions = "Reforge-MCP ports a restricted C int32 library subset to Rust. Start with get_porting_capabilities. Workflow: analyze_porting_project, create_porting_plan, generate_rust (or get_porting_context and submit_rust_candidate), verify_port with explicit entry-function cases, get_porting_report. Verification executes local code with limits, not a security sandbox. Completion is fixture-scoped; C++, Java, Python, Go porting and Joern integration remain planned. Source lookup and generic roadmap tools remain available."
+    instructions = "Reforge-MCP provides agent-facing Rust migration campaigns and a restricted C int32 translation backend. Start with get_porting_capabilities. Campaign workflow: inventory_project, inspect paginated files/source context, register_dependency_requirements, agent researches and records candidates, plan_dependency_adapter, agent prepares implementations and local executables, verify_dependency_replacement, next_migration_tasks. Missing replacements can link create_dependency_campaign. Research metadata is agent asserted; server does not search registries or compile dependency probes. Accepted dependency fixtures never mean whole-program completion. C translation workflow: analyze_porting_project, create_porting_plan, generate_rust or submit_rust_candidate, verify_port, get_porting_report. Local execution has limits, not an OS sandbox. Java/C++/Python/Go translation and Joern remain planned."
 )]
 impl ServerHandler for ReforgeServer {}
 

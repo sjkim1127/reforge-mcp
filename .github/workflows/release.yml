@@ -154,7 +154,7 @@ jobs:
             README.md \
             docs \
             scripts \
-            fixtures/porting \
+            fixtures \
             LICENSE
           echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 

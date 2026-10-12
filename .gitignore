@@ -29,3 +29,6 @@ release_notes*.md
 
 # Persistent local porting smoke artifacts
 .reforge-demo/
+
+# Python smoke client imports
+__pycache__/
