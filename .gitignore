@@ -32,3 +32,6 @@ release_notes*.md
 
 # Python smoke client imports
 __pycache__/
+
+# Local reference repositories (code reference only, not a dependency)
+/vendor/

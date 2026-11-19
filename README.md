@@ -27,8 +27,8 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 | 기능 | 상태 |
 |---|---|
 | C 분석과 소스 스냅샷 | Clang AST, `compile_commands.json`, `CMakeLists.txt`/`Makefile`/재귀 Kbuild/`.config` 수집, 파일/내용 해시, 헤더·매크로 전처리, 미지원 구문 거부 |
-| 포팅 계획과 컨텍스트 | 함수 의존성 순서, 재귀 그룹, 구조체·union·상수·외부 심볼·Kconfig 목록, 원본 범위와 Rust 대응 |
-| Rust 자동 생성 | 부호/무부호·고정폭 정수·`float`/`double`·enum·`void`·구조체/union·비트필드·배열·포인터·함수 포인터(`extern "C"`)·문자열·`static const`·루프·`switch`·전방 `goto`·`sizeof`·`malloc`/libc/builtin 호출, `rf_abi_*` 내보내기 및 커널 `#![no_std]`/`Kbuild`/`rf_port_bindings.h` 어댑터 |
+| 포팅 계획과 컨텍스트 | 함수 의존성 순서, 재귀 그룹, 포인터 접근·소유권 계약(`pointer_contracts`), 구조체·union·상수·외부 심볼·Kconfig 목록, 원본 범위와 Rust 대응 |
+| Rust 자동 생성 | 부호/무부호·고정폭 정수·`float`/`double`·enum·`void`·구조체/union·비트필드·배열(문자열 패딩 포함)·포인터·함수 포인터(`extern "C"`)·`rf_safe_*` 안전 래퍼·문자열·`static const`·루프·`switch`·전방 `goto`·`sizeof`·`malloc`/libc/builtin 호출, `rf_abi_*` 내보내기 및 커널 `#![no_std]`/`Kbuild`/`rf_port_bindings.h` 어댑터 |
 | AI 후보 제출 | `src/lib.rs`를 새 시도로 저장; 자동 생성 후보와 같은 검증 경로 사용 |
 | 원본/Rust 차등 검증 | C UBSan(`-lm` 링크), offline Cargo 빌드, `#![no_std]` rlib 및 C 바인딩 헤더 검증, 양방향 C↔Rust FFI 경계 링크, 동일 입력의 stdout/stderr/종료 코드 비교 |
 | 작업 저장과 재개 | SQLite 작업/이벤트, 생성·검증 이력, 소스/후보 변경 시 검증 만료 |

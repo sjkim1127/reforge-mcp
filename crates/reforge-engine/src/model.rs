@@ -43,6 +43,16 @@ fn default_int_type() -> String {
     "int".into()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerParamContract {
+    pub param_index: usize,
+    pub name: String,
+    pub c_type: String,
+    pub access: String,
+    pub kind: String,
+    pub safe_rust_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
@@ -59,6 +69,10 @@ pub struct Function {
     pub external_dependencies: Vec<String>,
     #[serde(default)]
     pub is_static: bool,
+    #[serde(default)]
+    pub pointer_contracts: Vec<PointerParamContract>,
+    #[serde(default)]
+    pub safe_rust_wrapper: Option<String>,
     pub rust: String,
 }
 

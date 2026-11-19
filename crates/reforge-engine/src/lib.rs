@@ -184,6 +184,7 @@ impl Engine {
         job.kconfig = kb.kconfig.clone();
         job.inactive_source_files = kb.inactive_units.clone();
         let compile_flags = load_compile_commands(&snapshot, Path::new(&job.source_path))?;
+        let auto_includes = header_include_flags(&snapshot, &job.source_files);
         let mut prototypes: BTreeMap<String, ExternalFunction> = BTreeMap::new();
         for (i, file) in job.source_files.iter().enumerate() {
             if !file.path.ends_with(".c") {
@@ -214,6 +215,7 @@ impl Engine {
                 "-I".into(),
                 snapshot.display().to_string(),
             ]);
+            args.extend(auto_includes.iter().cloned());
             args.extend(kb_flags);
             args.extend(extra_flags.iter().cloned());
             args.extend([
@@ -855,6 +857,7 @@ impl Engine {
         let snapshot = self.store.directory(&job.job_id)?.join("source");
         let kb = kbuild::load(&snapshot)?;
         let compile_flags = load_compile_commands(&snapshot, Path::new(&job.source_path))?;
+        let auto_includes = header_include_flags(&snapshot, &job.source_files);
         let original = dir.join(executable("original"));
 
         if compile_flags.is_empty() && kb.cflags.is_empty() && kb.dir_cflags.is_empty() {
@@ -867,6 +870,7 @@ impl Engine {
                 "-fsanitize=undefined".into(),
                 "-fno-sanitize-recover=all".into(),
             ];
+            args.extend(auto_includes.iter().cloned());
             args.extend(
                 job.source_files
                     .iter()
@@ -917,6 +921,7 @@ impl Engine {
                     "-fsanitize=undefined".into(),
                     "-fno-sanitize-recover=all".into(),
                 ]);
+                args.extend(auto_includes.iter().cloned());
                 args.extend(kb_flags);
                 args.extend(extra.iter().cloned());
                 args.extend([
@@ -981,6 +986,7 @@ impl Engine {
                 "-I".into(),
                 snapshot.display().to_string(),
             ]);
+            args.extend(auto_includes.iter().cloned());
             args.extend(kb_flags);
             args.extend(extra.iter().cloned());
             args.extend([
@@ -1536,6 +1542,24 @@ fn source_files(root: &Path) -> Result<Vec<String>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn header_include_flags(snapshot: &Path, files: &[SourceFile]) -> Vec<String> {
+    let mut dirs = BTreeSet::new();
+    for file in files {
+        if file.path.ends_with(".h")
+            && let Some(parent) = Path::new(&file.path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            dirs.insert(snapshot.join(parent));
+        }
+    }
+    let mut flags = Vec::with_capacity(dirs.len() * 2);
+    for d in dirs {
+        flags.push("-I".into());
+        flags.push(d.display().to_string());
+    }
+    flags
 }
 
 fn is_c_boundary_file(path: &str) -> bool {

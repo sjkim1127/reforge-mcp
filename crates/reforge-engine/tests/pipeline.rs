@@ -1361,3 +1361,155 @@ int run_userspace_lib(int n, int seed) {
         .unwrap();
     assert_eq!(verified.state, "completed", "{}", describe(&verified));
 }
+
+#[tokio::test]
+async fn c2rust_builtins_overflow_string_padding_and_deferred_init_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "c2rust_features.c",
+        r#"
+#include <stdint.h>
+#include <stdbool.h>
+
+static const char K_HDR[8] = "HDR";
+
+int eval_builtins(int a, int b) {
+    int sum;
+    int diff;
+    int prod;
+    bool ovf_add = __builtin_add_overflow(a, b, &sum);
+    bool ovf_sub = __builtin_sub_overflow(a, b, &diff);
+    bool ovf_mul = __builtin_mul_overflow(a, b, &prod);
+
+    int delayed;
+    if ((a & 1) == 0) {
+        delayed = 11;
+    } else {
+        delayed = 23;
+    }
+
+    char padded[12] = "tag";
+    char braced[8] = { "ok" };
+    char exact[4] = "ABCD";
+
+    uint32_t u = (uint32_t)a;
+    uint32_t r = __builtin_rotateleft32(u, 5) ^ __builtin_rotateright32(u, 3);
+    int ffs_val = __builtin_ffs(a);
+    int parity_val = __builtin_parity(u);
+    int const_p = __builtin_constant_p(a);
+
+    double d = (double)a * 0.5;
+    int f_checks = __builtin_isnan(d) + __builtin_isfinite(d) + __builtin_signbit(d);
+
+    int acc = delayed
+        + (ovf_add ? 1000 : (sum & 0xffff))
+        + (ovf_sub ? 2000 : (diff & 0xffff))
+        + (ovf_mul ? 3000 : (prod & 0xffff))
+        + (int)padded[0] + (int)padded[11]
+        + (int)braced[0] + (int)braced[7]
+        + (int)exact[0] + (int)exact[3]
+        + (int)K_HDR[0] + (int)K_HDR[7]
+        + (int)(r & 0xffffu) + ffs_val + parity_val + const_p + f_checks;
+    return acc;
+}
+"#,
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "eval_builtins",
+            vec![
+                vec![0, 5],
+                vec![7, 13],
+                vec![2147483640, 100],
+                vec![-2147483640, -100],
+                vec![100000, 100000],
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn crown_pointer_contracts_and_safe_rust_wrappers_compile_and_verify() {
+    let workspace = Workspace::new();
+    std::fs::create_dir(workspace.source.join("sub_inc")).unwrap();
+    workspace.write("sub_inc/ops.h", "struct Node { int val; int weight; };\n");
+    workspace.write(
+        "ptr_ops.c",
+        r#"
+#include "ops.h"
+
+void scale_node(struct Node *n, const int *bias) {
+    if (!n || !bias) return;
+    n->val = n->val * n->weight + *bias;
+}
+
+int sum_slice(const int *arr, int len) {
+    int s = 0;
+    for (int i = 0; i < len; i++) {
+        s += arr[i];
+    }
+    return s;
+}
+
+int run_contracts(int init_val, int bias) {
+    struct Node node = { init_val, 3 };
+    scale_node(&node, &bias);
+    int items[3] = { node.val, node.weight, bias };
+    return sum_slice(items, 3);
+}
+"#,
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+
+    let scale_fn = job
+        .functions
+        .iter()
+        .find(|f| f.name == "scale_node")
+        .unwrap();
+    assert_eq!(scale_fn.pointer_contracts.len(), 2);
+    assert_eq!(scale_fn.pointer_contracts[0].access, "read_write");
+    assert_eq!(scale_fn.pointer_contracts[0].kind, "ref");
+    assert_eq!(
+        scale_fn.pointer_contracts[0].safe_rust_type,
+        "&mut RfStruct_Node"
+    );
+    assert_eq!(scale_fn.pointer_contracts[1].access, "read_only");
+    assert_eq!(scale_fn.pointer_contracts[1].kind, "ref");
+    assert_eq!(scale_fn.pointer_contracts[1].safe_rust_type, "&i32");
+    let wrapper = scale_fn.safe_rust_wrapper.as_deref().unwrap();
+    assert!(wrapper.contains("pub fn rf_safe_scale_node"));
+
+    let sum_fn = job
+        .functions
+        .iter()
+        .find(|f| f.name == "sum_slice")
+        .unwrap();
+    assert_eq!(sum_fn.pointer_contracts.len(), 1);
+    assert_eq!(sum_fn.pointer_contracts[0].access, "read_only");
+    assert_eq!(sum_fn.pointer_contracts[0].kind, "slice_or_offset");
+    assert!(sum_fn.safe_rust_wrapper.is_none());
+
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "run_contracts",
+            vec![vec![-4, 2], vec![0, 5], vec![9, -3]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}

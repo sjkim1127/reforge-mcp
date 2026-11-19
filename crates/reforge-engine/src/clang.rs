@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::model::{ExternalFunction, Function, StructDef, StructField};
+use crate::model::{ExternalFunction, Function, PointerParamContract, StructDef, StructField};
 
 pub struct TranslationUnitOutput {
     pub structs: Vec<StructDef>,
@@ -878,6 +878,281 @@ fn parse_c_string_literal(raw: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn format_string_literal_array(raw: &str, expected_len: Option<usize>) -> Result<String> {
+    let mut bytes = parse_c_string_literal(raw)?;
+    if let Some(len) = expected_len {
+        if bytes.len() == len + 1 && bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        ensure!(
+            bytes.len() <= len,
+            "string literal exceeds target array length {len}"
+        );
+        bytes.resize(len, 0);
+    }
+    let char_rty = IntKind::Char.rust_type();
+    let elems = bytes
+        .iter()
+        .map(|b| {
+            if char_rty == "i8" {
+                format!("{}i8", (*b as i8))
+            } else {
+                format!("{b}u8")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("[{elems}]"))
+}
+
+fn local_initializer(declaration: &Value) -> Result<Option<&Value>> {
+    let ch = children(declaration);
+    ensure!(
+        ch.len() <= 1 && ch.iter().all(|c| !kind(c).ends_with("Attr")),
+        "locals must have zero or one initializer and no attributes"
+    );
+    Ok(ch.first())
+}
+
+fn is_scalar_type(ty: &CType) -> bool {
+    matches!(
+        ty,
+        CType::Int(_) | CType::Float(_) | CType::Ptr { .. } | CType::FnPtr { .. }
+    )
+}
+
+#[derive(Default, Clone)]
+struct PtrUsage {
+    mutated: bool,
+    indexed_or_offset: bool,
+}
+
+fn unwrap_paren_cast(mut node: &Value) -> &Value {
+    while matches!(
+        kind(node),
+        "ParenExpr" | "ImplicitCastExpr" | "CStyleCastExpr"
+    ) {
+        if let Some(ch) = children(node).first() {
+            node = ch;
+        } else {
+            break;
+        }
+    }
+    node
+}
+
+fn bare_decl_id(node: &Value) -> Option<&str> {
+    let inner = unwrap_paren_cast(node);
+    (kind(inner) == "DeclRefExpr").then(|| text(&inner["referencedDecl"], "id"))
+}
+
+fn pointee_decl_id(node: &Value) -> Option<&str> {
+    let mut cur = unwrap_paren_cast(node);
+    loop {
+        match kind(cur) {
+            "MemberExpr" => {
+                if cur["isArrow"].as_bool().unwrap_or(false) {
+                    return children(cur).first().and_then(|c| bare_decl_id(c));
+                }
+                cur = unwrap_paren_cast(children(cur).first()?);
+            }
+            "ArraySubscriptExpr" => {
+                return children(cur).iter().find_map(|c| bare_decl_id(c));
+            }
+            "UnaryOperator" if text(cur, "opcode") == "*" => {
+                return children(cur).first().and_then(|c| bare_decl_id(c));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn collect_ptr_usage(
+    node: &Value,
+    ptr_ids: &BTreeSet<String>,
+    usage: &mut BTreeMap<String, PtrUsage>,
+) {
+    let inner = children(node);
+    match kind(node) {
+        "BinaryOperator" if text(node, "opcode") == "=" && inner.len() == 2 => {
+            if let Some(id) = pointee_decl_id(&inner[0])
+                && ptr_ids.contains(id)
+            {
+                usage.entry(id.to_owned()).or_default().mutated = true;
+            }
+        }
+        "BinaryOperator" if matches!(text(node, "opcode"), "+" | "-") && inner.len() == 2 => {
+            for side in &inner[..2] {
+                if let Some(id) = bare_decl_id(side)
+                    && ptr_ids.contains(id)
+                {
+                    usage.entry(id.to_owned()).or_default().indexed_or_offset = true;
+                }
+            }
+        }
+        "CompoundAssignOperator" if inner.len() == 2 => {
+            if let Some(id) = bare_decl_id(&inner[0])
+                && ptr_ids.contains(id)
+            {
+                usage.entry(id.to_owned()).or_default().indexed_or_offset = true;
+            } else if let Some(id) = pointee_decl_id(&inner[0])
+                && ptr_ids.contains(id)
+            {
+                usage.entry(id.to_owned()).or_default().mutated = true;
+            }
+        }
+        "UnaryOperator" if matches!(text(node, "opcode"), "++" | "--") && inner.len() == 1 => {
+            if let Some(id) = bare_decl_id(&inner[0])
+                && ptr_ids.contains(id)
+            {
+                usage.entry(id.to_owned()).or_default().indexed_or_offset = true;
+            } else if let Some(id) = pointee_decl_id(&inner[0])
+                && ptr_ids.contains(id)
+            {
+                usage.entry(id.to_owned()).or_default().mutated = true;
+            }
+        }
+        "UnaryOperator" if text(node, "opcode") == "&" && inner.len() == 1 => {
+            if let Some(id) = pointee_decl_id(&inner[0])
+                && ptr_ids.contains(id)
+            {
+                usage.entry(id.to_owned()).or_default().mutated = true;
+            }
+        }
+        "ArraySubscriptExpr" if inner.len() == 2 => {
+            for side in &inner[..2] {
+                if let Some(id) = bare_decl_id(side)
+                    && ptr_ids.contains(id)
+                {
+                    let u = usage.entry(id.to_owned()).or_default();
+                    u.indexed_or_offset = true;
+                }
+            }
+        }
+        "CallExpr" if !inner.is_empty() => {
+            for arg in &inner[1..] {
+                if let Some(id) = bare_decl_id(arg)
+                    && ptr_ids.contains(id)
+                    && let Ok(arg_ty) = CType::from_node_type(&arg["type"], &BTreeMap::new())
+                    && let CType::Ptr {
+                        inner_const: false, ..
+                    } = arg_ty
+                {
+                    let u = usage.entry(id.to_owned()).or_default();
+                    u.mutated = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in inner {
+        collect_ptr_usage(child, ptr_ids, usage);
+    }
+}
+
+fn analyze_pointer_params(
+    fn_name: &str,
+    body: &Value,
+    param_nodes: &[&Value],
+    param_types: &[CType],
+    param_names: &[String],
+    return_ctype: &CType,
+) -> (Vec<PointerParamContract>, Option<String>) {
+    let mut ptr_ids = BTreeSet::new();
+    for (pnode, pty) in param_nodes.iter().zip(param_types) {
+        if matches!(pty, CType::Ptr { .. }) {
+            ptr_ids.insert(text(pnode, "id").to_owned());
+        }
+    }
+    if ptr_ids.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut usage = BTreeMap::new();
+    collect_ptr_usage(body, &ptr_ids, &mut usage);
+
+    let mut contracts = Vec::new();
+    let mut all_ptr_refs = true;
+    for (idx, ((pnode, pty), pname)) in param_nodes
+        .iter()
+        .zip(param_types)
+        .zip(param_names)
+        .enumerate()
+    {
+        let CType::Ptr { inner, inner_const } = pty else {
+            continue;
+        };
+        let id = text(pnode, "id");
+        let stats = usage.get(id).cloned().unwrap_or_default();
+        let read_only = *inner_const || !stats.mutated;
+        let access = if read_only { "read_only" } else { "read_write" };
+        let is_raw_only = matches!(**inner, CType::Void | CType::Ptr { .. } | CType::Array(..));
+        let (kind, safe_rust_type) = if is_raw_only {
+            all_ptr_refs = false;
+            ("raw".to_string(), pty.rust_type())
+        } else if stats.indexed_or_offset {
+            all_ptr_refs = false;
+            let raw_ty = if read_only {
+                format!("*const {}", inner.rust_type())
+            } else {
+                format!("*mut {}", inner.rust_type())
+            };
+            ("slice_or_offset".to_string(), raw_ty)
+        } else {
+            let ref_ty = if read_only {
+                format!("&{}", inner.rust_type())
+            } else {
+                format!("&mut {}", inner.rust_type())
+            };
+            ("ref".to_string(), ref_ty)
+        };
+        contracts.push(PointerParamContract {
+            param_index: idx,
+            name: pname.clone(),
+            c_type: pty.c_type(),
+            access: access.into(),
+            kind,
+            safe_rust_type,
+        });
+    }
+
+    let non_ptrs_scalar = param_types
+        .iter()
+        .all(|t| matches!(t, CType::Int(_) | CType::Float(_) | CType::Ptr { .. }));
+    let ret_scalar_or_void = matches!(return_ctype, CType::Void | CType::Int(_) | CType::Float(_));
+    let wrapper = if all_ptr_refs && non_ptrs_scalar && ret_scalar_or_void {
+        let mut sig_parts = Vec::with_capacity(param_types.len());
+        let mut call_args = Vec::with_capacity(param_types.len());
+        for (i, pty) in param_types.iter().enumerate() {
+            if let CType::Ptr { inner, .. } = pty {
+                let contract = contracts.iter().find(|c| c.param_index == i).unwrap();
+                sig_parts.push(format!("v{i}: {}", contract.safe_rust_type));
+                if contract.access == "read_only" {
+                    call_args.push(format!("(v{i} as *const {}).cast_mut()", inner.rust_type()));
+                } else {
+                    call_args.push(format!("v{i} as *mut {}", inner.rust_type()));
+                }
+            } else {
+                sig_parts.push(format!("v{i}: {}", pty.rust_type()));
+                call_args.push(format!("v{i}"));
+            }
+        }
+        let ret_suffix = if matches!(return_ctype, CType::Void) {
+            String::new()
+        } else {
+            format!(" -> {}", return_ctype.rust_type())
+        };
+        Some(format!(
+            "pub fn rf_safe_{fn_name}({}){ret_suffix} {{\n    rf_{fn_name}({})\n}}\n",
+            sig_parts.join(", "),
+            call_args.join(", "),
+        ))
+    } else {
+        None
+    };
+
+    (contracts, wrapper)
+}
+
 pub fn translate(
     ast: &Value,
     translation_unit: &Path,
@@ -1187,6 +1462,7 @@ pub fn translate(
                 let mut temp_deps = prototypes.clone();
                 let mut temp_emitter = Emitter {
                     variables: BTreeMap::new(),
+                    uninit_scalars: BTreeSet::new(),
                     const_globals: &const_globals,
                     dependencies: BTreeSet::new(),
                     next_variable: 0,
@@ -1286,6 +1562,7 @@ pub fn translate(
         let source = std::fs::read_to_string(&physical_file)?;
         let mut emitter = Emitter {
             variables: BTreeMap::new(),
+            uninit_scalars: BTreeSet::new(),
             const_globals: &const_globals,
             dependencies: BTreeSet::new(),
             next_variable: 0,
@@ -1318,6 +1595,14 @@ pub fn translate(
         }
         emitter.next_variable = params.len();
         let body_code = emitter.statement(body)?;
+        let (pointer_contracts, safe_rust_wrapper) = analyze_pointer_params(
+            name,
+            body,
+            &params,
+            &param_ctypes,
+            &parameters,
+            &return_ctype,
+        );
         let abi_export = if is_static {
             String::new()
         } else {
@@ -1332,14 +1617,15 @@ pub fn translate(
                 abi_args.join(", "),
             )
         };
+        let safe_export = safe_rust_wrapper.as_deref().unwrap_or("");
         let rust = if matches!(return_ctype, CType::Void) {
             format!(
-                "pub extern \"C\" fn rf_{name}({}) {{\nunsafe {{\n{body_code}\n}}\n}}\n{abi_export}",
+                "pub extern \"C\" fn rf_{name}({}) {{\nunsafe {{\n{body_code}\n}}\n}}\n{abi_export}{safe_export}",
                 signature.join(", ")
             )
         } else {
             format!(
-                "pub extern \"C\" fn rf_{name}({}) -> {} {{\nunsafe {{\n{body_code}\npanic!(\"C function reached end without a return\");\n}}\n}}\n{abi_export}",
+                "pub extern \"C\" fn rf_{name}({}) -> {} {{\nunsafe {{\n{body_code}\npanic!(\"C function reached end without a return\");\n}}\n}}\n{abi_export}{safe_export}",
                 signature.join(", "),
                 return_ctype.rust_type()
             )
@@ -1356,6 +1642,8 @@ pub fn translate(
             dependencies: emitter.dependencies.into_iter().collect(),
             external_dependencies: Vec::new(),
             is_static,
+            pointer_contracts,
+            safe_rust_wrapper,
             rust,
         });
     }
@@ -1412,6 +1700,7 @@ fn flatten_switch_node<'a>(
 
 struct Emitter<'a> {
     variables: BTreeMap<String, (String, CType)>,
+    uninit_scalars: BTreeSet<String>,
     const_globals: &'a BTreeMap<String, (String, CType, bool)>,
     dependencies: BTreeSet<String>,
     next_variable: usize,
@@ -1440,6 +1729,10 @@ impl Emitter<'_> {
         );
         let id = text(&node["referencedDecl"], "id");
         if let Some(v) = self.variables.get(id) {
+            ensure!(
+                !self.uninit_scalars.contains(id),
+                "read of uninitialized local variable"
+            );
             return Ok(v.clone());
         }
         if let Some((name, ty, _)) = self.const_globals.get(id) {
@@ -1686,6 +1979,16 @@ impl Emitter<'_> {
                 ))
             }
             CType::Array(elem_ty, len) => {
+                let inner = children(node);
+                if inner.len() == 1
+                    && kind(&inner[0]) == "StringLiteral"
+                    && matches!(
+                        **elem_ty,
+                        CType::Int(IntKind::Char | IntKind::I8 | IntKind::U8)
+                    )
+                {
+                    return format_string_literal_array(text(&inner[0], "value"), Some(*len));
+                }
                 let mut elem_exprs = Vec::with_capacity(*len);
                 if let Some(filler_arr) = node["array_filler"].as_array()
                     && !filler_arr.is_empty()
@@ -1703,7 +2006,6 @@ impl Emitter<'_> {
                         elem_exprs.push(e);
                     }
                 } else {
-                    let inner = children(node);
                     ensure!(inner.len() <= *len, "too many array initializers");
                     for idx in 0..*len {
                         let e = if let Some(src) = inner.get(idx) {
@@ -1807,20 +2109,12 @@ impl Emitter<'_> {
             }
             "StringLiteral" => {
                 let ty = CType::from_node_type(&node["type"], self.typedefs)?;
-                let bytes = parse_c_string_literal(text(node, "value"))?;
-                let char_rty = IntKind::Char.rust_type();
-                let elems = bytes
-                    .iter()
-                    .map(|b| {
-                        if char_rty == "i8" {
-                            format!("{}i8", (*b as i8))
-                        } else {
-                            format!("{b}u8")
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Ok((format!("[{elems}]"), ty))
+                let expected_len = match &ty {
+                    CType::Array(_, len) => Some(*len),
+                    _ => None,
+                };
+                let expr = format_string_literal_array(text(node, "value"), expected_len)?;
+                Ok((expr, ty))
             }
             "ConstantExpr" => {
                 if let Some(first) = inner.first() {
@@ -1935,21 +2229,10 @@ impl Emitter<'_> {
                     }
                     "ArrayToPointerDecay" => {
                         if kind(&inner[0]) == "StringLiteral" {
-                            let bytes = parse_c_string_literal(text(&inner[0], "value"))?;
                             let char_rty = IntKind::Char.rust_type();
-                            let elems = bytes
-                                .iter()
-                                .map(|b| {
-                                    if char_rty == "i8" {
-                                        format!("{}i8", (*b as i8))
-                                    } else {
-                                        format!("{b}u8")
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                            let arr = format_string_literal_array(text(&inner[0], "value"), None)?;
                             return Ok((
-                                format!("((&[{elems}]).as_ptr() as *mut {char_rty})"),
+                                format!("((&{arr}).as_ptr() as *mut {char_rty})"),
                                 target_ty,
                             ));
                         }
@@ -2152,6 +2435,9 @@ impl Emitter<'_> {
                             self.lvalue_bitfield(&inner[0]).is_none(),
                             "cannot take address of bitfield"
                         );
+                        if let Some(id) = bare_decl_id(&inner[0]) {
+                            self.uninit_scalars.remove(id);
+                        }
                         let (lv, lv_ty) = self.lvalue(&inner[0])?;
                         let rty = lv_ty.rust_type();
                         Ok((
@@ -2261,6 +2547,9 @@ impl Emitter<'_> {
                 match op {
                     "=" => {
                         let (mut rv, rty) = self.typed_expression(&inner[1])?;
+                        if let Some(id) = bare_decl_id(&inner[0]) {
+                            self.uninit_scalars.remove(id);
+                        }
                         let bf = self.lvalue_bitfield(&inner[0]);
                         let (lv, lty) = self.lvalue(&inner[0])?;
                         ensure!(lty.same_shape(&rty), "assignment type mismatch");
@@ -2475,6 +2764,7 @@ impl Emitter<'_> {
                     if name.starts_with("__builtin_") {
                         return self.try_emit_builtin(
                             name,
+                            node,
                             &inner[1..],
                             text(&ref_decl["type"], "qualType"),
                         );
@@ -2530,12 +2820,124 @@ impl Emitter<'_> {
         }
     }
 
+    fn emit_overflow_builtin(
+        &mut self,
+        name: &str,
+        op_char: char,
+        arg_nodes: &[Value],
+        ret_type: CType,
+    ) -> Result<(String, CType)> {
+        ensure!(
+            arg_nodes.len() == 3,
+            "overflow builtin {name} requires 3 arguments"
+        );
+        let (lhs, lty) = self.typed_expression(&arg_nodes[0])?;
+        let (rhs, rty) = self.typed_expression(&arg_nodes[1])?;
+        let (out_ptr, out_ptr_ty) = self.typed_expression(&arg_nodes[2])?;
+        ensure!(
+            matches!(lty, CType::Int(_)) && matches!(rty, CType::Int(_)),
+            "overflow builtin {name} integer operands required"
+        );
+        let CType::Ptr { inner, .. } = out_ptr_ty else {
+            bail!("overflow builtin {name} third operand must be integer pointer");
+        };
+        let CType::Int(out_ik) = *inner else {
+            bail!("overflow builtin {name} output pointee must be integer");
+        };
+        let out_rust = out_ik.rust_type();
+        let l_var = self.fresh_var("rf_ol");
+        let r_var = self.fresh_var("rf_or");
+        let p_var = self.fresh_var("rf_op");
+        let t_var = self.fresh_var("rf_ot");
+        let o_var = self.fresh_var("rf_ovf");
+        let calc = match op_char {
+            '+' | '-' => format!(
+                "let rf_exact: i128 = ({l_var} as i128) {op_char} ({r_var} as i128); let {t_var}: {out_rust} = rf_exact as {out_rust}; let {o_var}: bool = ({t_var} as i128) != rf_exact;"
+            ),
+            '*' => format!(
+                "let ({t_var}, {o_var}): ({out_rust}, bool) = match ({l_var} as i128).checked_mul({r_var} as i128) {{ Some(rf_exact) => {{ let rf_t = rf_exact as {out_rust}; (rf_t, (rf_t as i128) != rf_exact) }} None => ((({l_var} as u128).wrapping_mul({r_var} as u128) as {out_rust}), true) }};"
+            ),
+            _ => bail!("unsupported overflow op {op_char}"),
+        };
+        let ret_expr = match ret_type {
+            CType::Int(IntKind::Bool) => format!("u8::from({o_var})"),
+            CType::Int(ik) => format!("({}::from({o_var}))", ik.rust_type()),
+            _ => bail!("overflow builtin must return boolean or integer"),
+        };
+        Ok((
+            format!(
+                "{{ let {l_var} = {lhs}; let {r_var} = {rhs}; let {p_var} = rf_ptr({out_ptr}); {calc} *{p_var} = {t_var}; {ret_expr} }}"
+            ),
+            ret_type,
+        ))
+    }
+
     fn try_emit_builtin(
         &mut self,
         name: &str,
+        call_node: &Value,
         arg_nodes: &[Value],
         qual_type: &str,
     ) -> Result<(String, CType)> {
+        let generic_ret = CType::from_node_type(&call_node["type"], self.typedefs).ok();
+        match name {
+            "__builtin_add_overflow"
+            | "__builtin_sadd_overflow"
+            | "__builtin_saddl_overflow"
+            | "__builtin_saddll_overflow"
+            | "__builtin_uadd_overflow"
+            | "__builtin_uaddl_overflow"
+            | "__builtin_uaddll_overflow" => {
+                let rt = generic_ret.unwrap_or(CType::Int(IntKind::Bool));
+                return self.emit_overflow_builtin(name, '+', arg_nodes, rt);
+            }
+            "__builtin_sub_overflow"
+            | "__builtin_ssub_overflow"
+            | "__builtin_ssubl_overflow"
+            | "__builtin_ssubll_overflow"
+            | "__builtin_usub_overflow"
+            | "__builtin_usubl_overflow"
+            | "__builtin_usubll_overflow" => {
+                let rt = generic_ret.unwrap_or(CType::Int(IntKind::Bool));
+                return self.emit_overflow_builtin(name, '-', arg_nodes, rt);
+            }
+            "__builtin_mul_overflow"
+            | "__builtin_smul_overflow"
+            | "__builtin_smull_overflow"
+            | "__builtin_smulll_overflow"
+            | "__builtin_umul_overflow"
+            | "__builtin_umull_overflow"
+            | "__builtin_umulll_overflow" => {
+                let rt = generic_ret.unwrap_or(CType::Int(IntKind::Bool));
+                return self.emit_overflow_builtin(name, '*', arg_nodes, rt);
+            }
+            "__builtin_constant_p" => {
+                let rt = generic_ret.unwrap_or(CType::Int(IntKind::I32));
+                return Ok((format!("0{}", rt.rust_type()), rt));
+            }
+            "__builtin_isnan" | "__builtin_isfinite" | "__builtin_isinf" | "__builtin_signbit"
+            | "__builtin_signbitf" => {
+                ensure!(arg_nodes.len() == 1, "builtin {name} requires 1 argument");
+                let (expr, ty) = self.typed_expression(&arg_nodes[0])?;
+                ensure!(
+                    matches!(ty, CType::Float(_)),
+                    "builtin {name} requires float or double operand"
+                );
+                let rt = generic_ret.unwrap_or(CType::Int(IntKind::I32));
+                let method = match name {
+                    "__builtin_isnan" => "is_nan",
+                    "__builtin_isfinite" => "is_finite",
+                    "__builtin_isinf" => "is_infinite",
+                    _ => "is_sign_negative",
+                };
+                return Ok((
+                    format!("({}::from(({expr}).{method}()))", rt.rust_type()),
+                    rt,
+                ));
+            }
+            _ => {}
+        }
+
         let (param_types, ret_type) = parse_fn_signature(qual_type, self.typedefs)?;
         ensure!(
             arg_nodes.len() == param_types.len(),
@@ -2554,7 +2956,7 @@ impl Emitter<'_> {
             args.push(expr);
         }
         match name {
-            "__builtin___memcpy_chk" => {
+            "__builtin___memcpy_chk" | "__builtin_memcpy" => {
                 let d_var = self.fresh_var("rf_dst");
                 let s_var = self.fresh_var("rf_src");
                 let n_var = self.fresh_var("rf_len");
@@ -2566,7 +2968,7 @@ impl Emitter<'_> {
                     ret_type,
                 ))
             }
-            "__builtin___memmove_chk" => {
+            "__builtin___memmove_chk" | "__builtin_memmove" => {
                 let d_var = self.fresh_var("rf_dst");
                 let s_var = self.fresh_var("rf_src");
                 let n_var = self.fresh_var("rf_len");
@@ -2578,7 +2980,7 @@ impl Emitter<'_> {
                     ret_type,
                 ))
             }
-            "__builtin___memset_chk" => {
+            "__builtin___memset_chk" | "__builtin_memset" => {
                 let d_var = self.fresh_var("rf_dst");
                 let v_var = self.fresh_var("rf_val");
                 let n_var = self.fresh_var("rf_len");
@@ -2590,7 +2992,50 @@ impl Emitter<'_> {
                     ret_type,
                 ))
             }
+            "__builtin_bzero" => {
+                let d_var = self.fresh_var("rf_dst");
+                let n_var = self.fresh_var("rf_len");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {n_var} = ({}) as usize; if {n_var} > 0 {{ core::ptr::write_bytes({d_var} as *mut u8, 0u8, {n_var}); }} }}",
+                        args[0], args[1]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin___strcpy_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let s_var = self.fresh_var("rf_src");
+                let i_var = self.fresh_var("rf_idx");
+                let ch_var = self.fresh_var("rf_ch");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {s_var} = {}; let mut {i_var}: isize = 0; loop {{ let {ch_var} = *{s_var}.offset({i_var}); *{d_var}.offset({i_var}) = {ch_var}; if {ch_var} == 0 {{ break; }} {i_var} += 1; }} {d_var} }}",
+                        args[0], args[1]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin___strncpy_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let s_var = self.fresh_var("rf_src");
+                let n_var = self.fresh_var("rf_len");
+                let i_var = self.fresh_var("rf_idx");
+                let ch_var = self.fresh_var("rf_ch");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {s_var} = {}; let {n_var} = ({}) as usize; let mut {i_var}: usize = 0; while {i_var} < {n_var} {{ let {ch_var} = *{s_var}.add({i_var}); *{d_var}.add({i_var}) = {ch_var}; {i_var} += 1; if {ch_var} == 0 {{ while {i_var} < {n_var} {{ *{d_var}.add({i_var}) = 0; {i_var} += 1; }} break; }} }} {d_var} }}",
+                        args[0], args[1], args[2]
+                    ),
+                    ret_type,
+                ))
+            }
             "__builtin_expect" => Ok((args.into_iter().next().unwrap(), ret_type)),
+            "__builtin_prefetch" => Ok(("()".into(), CType::Void)),
+            "__builtin_unreachable" => {
+                Ok(("core::hint::unreachable_unchecked()".into(), CType::Void))
+            }
+            "__builtin_trap" => Ok(("panic!(\"__builtin_trap\")".into(), CType::Void)),
             "__builtin_bswap16" | "__builtin_bswap32" | "__builtin_bswap64" => Ok((
                 format!("(({}) as {}).swap_bytes()", args[0], ret_type.rust_type()),
                 ret_type,
@@ -2613,6 +3058,22 @@ impl Emitter<'_> {
                 ),
                 ret_type,
             )),
+            "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" => {
+                let CType::Int(ik) = param_types[0] else {
+                    bail!("ffs requires integer argument");
+                };
+                let uty = ik.unsigned_rust_type();
+                let x_var = self.fresh_var("rf_ffs");
+                Ok((
+                    format!(
+                        "{{ let {x_var} = ({}) as {uty}; if {x_var} == 0 {{ 0{} }} else {{ ({x_var}.trailing_zeros() + 1) as {} }} }}",
+                        args[0],
+                        ret_type.rust_type(),
+                        ret_type.rust_type()
+                    ),
+                    ret_type,
+                ))
+            }
             "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll" => Ok((
                 format!(
                     "((({}) as {}).count_ones() as {})",
@@ -2622,6 +3083,43 @@ impl Emitter<'_> {
                 ),
                 ret_type,
             )),
+            "__builtin_parity" | "__builtin_parityl" | "__builtin_parityll" => Ok((
+                format!(
+                    "(((({}) as {}).count_ones() & 1) as {})",
+                    args[0],
+                    param_types[0].rust_type(),
+                    ret_type.rust_type()
+                ),
+                ret_type,
+            )),
+            "__builtin_rotateleft8"
+            | "__builtin_rotateleft16"
+            | "__builtin_rotateleft32"
+            | "__builtin_rotateleft64" => Ok((
+                format!(
+                    "(({}) as {}).rotate_left(({}) as u32)",
+                    args[0],
+                    ret_type.rust_type(),
+                    args[1]
+                ),
+                ret_type,
+            )),
+            "__builtin_rotateright8"
+            | "__builtin_rotateright16"
+            | "__builtin_rotateright32"
+            | "__builtin_rotateright64" => Ok((
+                format!(
+                    "(({}) as {}).rotate_right(({}) as u32)",
+                    args[0],
+                    ret_type.rust_type(),
+                    args[1]
+                ),
+                ret_type,
+            )),
+            "__builtin_inf" | "__builtin_huge_val" => Ok(("f64::INFINITY".into(), ret_type)),
+            "__builtin_inff" | "__builtin_huge_valf" => Ok(("f32::INFINITY".into(), ret_type)),
+            "__builtin_nan" => Ok(("f64::NAN".into(), ret_type)),
+            "__builtin_nanf" => Ok(("f32::NAN".into(), ret_type)),
             "__builtin_fabs" => Ok((
                 format!(
                     "f64::from_bits((({}) as f64).to_bits() & !(1u64 << 63))",
@@ -2663,7 +3161,7 @@ impl Emitter<'_> {
         }
 
         // Hoist top-level DeclStmt bindings so variables remain in scope after forward gotos.
-        let mut decl_inits: BTreeMap<usize, Vec<(String, CType, Value)>> = BTreeMap::new();
+        let mut decl_inits: BTreeMap<usize, Vec<(String, String, CType, Value)>> = BTreeMap::new();
         for (seg_idx, (_, stmts)) in segments.iter().enumerate() {
             for (stmt_idx, stmt) in stmts.iter().enumerate() {
                 if kind(stmt) == "DeclStmt" {
@@ -2682,21 +3180,22 @@ impl Emitter<'_> {
                             text(declaration, "storageClass").is_empty(),
                             "static/extern locals unsupported"
                         );
-                        ensure!(
-                            children(declaration).len() == 1,
-                            "locals must have one initializer and no attributes"
-                        );
+                        let decl_id = text(declaration, "id").to_owned();
                         let name = self.fresh_var("v");
                         let rust_ty = var_ty.rust_type();
                         let zero = var_ty.zero_expr(self.structs)?;
-                        self.variables.insert(
-                            text(declaration, "id").into(),
-                            (name.clone(), var_ty.clone()),
-                        );
+                        self.variables
+                            .insert(decl_id.clone(), (name.clone(), var_ty.clone()));
                         hoisted.push(format!("let mut {name}: {rust_ty} = {zero};"));
-                        init_pairs.push((name, var_ty, children(declaration)[0].clone()));
+                        if let Some(init_node) = local_initializer(declaration)? {
+                            init_pairs.push((decl_id, name, var_ty, init_node.clone()));
+                        } else if is_scalar_type(&var_ty) {
+                            self.uninit_scalars.insert(decl_id);
+                        }
                     }
-                    decl_inits.insert((seg_idx << 16) | stmt_idx, init_pairs);
+                    if !init_pairs.is_empty() {
+                        decl_inits.insert((seg_idx << 16) | stmt_idx, init_pairs);
+                    }
                 }
             }
         }
@@ -2719,12 +3218,13 @@ impl Emitter<'_> {
                 let mut out_stmts = Vec::new();
                 for (stmt_idx, stmt) in stmts.iter().enumerate() {
                     if let Some(inits) = decl_inits.get(&((seg_idx << 16) | stmt_idx)) {
-                        for (vname, vty, init_node) in inits {
+                        for (decl_id, vname, vty, init_node) in inits {
                             let (val_expr, val_ty) = self.typed_expression(init_node)?;
                             ensure!(vty.same_shape(&val_ty), "local initializer type mismatch");
+                            self.uninit_scalars.remove(decl_id);
                             out_stmts.push(format!("{vname} = {val_expr};"));
                         }
-                    } else {
+                    } else if kind(stmt) != "DeclStmt" {
                         out_stmts.push(self.statement(stmt)?);
                     }
                 }
@@ -2791,10 +3291,20 @@ impl Emitter<'_> {
                     "unsupported if structure"
                 );
                 let condition = self.condition(&inner[0])?;
+                let saved = self.uninit_scalars.clone();
                 let branch = self.statement(&inner[1])?;
+                let after_then = self.uninit_scalars.clone();
                 let other = if inner.len() == 3 {
-                    format!(" else {{ {} }}", self.statement(&inner[2])?)
+                    self.uninit_scalars = saved;
+                    let res = format!(" else {{ {} }}", self.statement(&inner[2])?);
+                    self.uninit_scalars = self
+                        .uninit_scalars
+                        .intersection(&after_then)
+                        .cloned()
+                        .collect();
+                    res
                 } else {
+                    self.uninit_scalars = saved;
                     String::new()
                 };
                 Ok(format!("if {condition} {{ {branch} }}{other}"))
@@ -2805,12 +3315,14 @@ impl Emitter<'_> {
                     "unsupported while structure"
                 );
                 let condition = self.condition(&inner[0])?;
+                let saved = self.uninit_scalars.clone();
                 let loop_label = self.fresh_var("'rf_lp");
                 self.loop_labels.push(loop_label.clone());
                 self.break_target.push(None);
                 let body = self.statement(&inner[1]);
                 self.break_target.pop();
                 self.loop_labels.pop();
+                self.uninit_scalars = saved;
                 Ok(format!("{loop_label}: while {condition} {{ {} }}", body?))
             }
             "DoStmt" => {
@@ -2975,19 +3487,24 @@ impl Emitter<'_> {
                         text(declaration, "storageClass").is_empty(),
                         "static/extern locals unsupported"
                     );
-                    ensure!(
-                        children(declaration).len() == 1,
-                        "locals must have one initializer and no attributes"
-                    );
-                    let (value, val_ty) = self.typed_expression(&children(declaration)[0])?;
-                    ensure!(
-                        var_ty.same_shape(&val_ty),
-                        "local initializer type mismatch"
-                    );
+                    let decl_id = text(declaration, "id").to_owned();
                     let name = self.fresh_var("v");
                     let rust_ty = var_ty.rust_type();
-                    self.variables
-                        .insert(text(declaration, "id").into(), (name.clone(), var_ty));
+                    let value = if let Some(init_node) = local_initializer(declaration)? {
+                        let (val, val_ty) = self.typed_expression(init_node)?;
+                        ensure!(
+                            var_ty.same_shape(&val_ty),
+                            "local initializer type mismatch"
+                        );
+                        val
+                    } else {
+                        let z = var_ty.zero_expr(self.structs)?;
+                        if is_scalar_type(&var_ty) {
+                            self.uninit_scalars.insert(decl_id.clone());
+                        }
+                        z
+                    };
+                    self.variables.insert(decl_id, (name.clone(), var_ty));
                     statements.push(format!("let mut {name}: {rust_ty} = {value};"));
                 }
                 Ok(statements.join("\n"))
