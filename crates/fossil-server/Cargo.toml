@@ -11,6 +11,7 @@ name = "reforge-mcp"
 path = "src/main.rs"
 
 [dependencies]
+reforge-engine = { path = "../reforge-engine" }
 fossil-core.workspace = true
 fossil-repo.workspace = true
 fossil-indexer.workspace = true

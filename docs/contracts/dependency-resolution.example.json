@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "document_kind": "design_example_not_implemented_api",
+  "requirement_id": "dep-demo-record-store",
+  "source": {
+    "ecosystem": "c",
+    "package": "example_record_store",
+    "version": "1.0",
+    "used_apis": ["open", "begin", "put", "get", "commit", "rollback"],
+    "usage_evidence": [{"file": "src/storage.c", "scope": "illustrative_not_real_source"}],
+    "unknown_usage": ["dynamic plugins not yet inventoried"]
+  },
+  "required_contracts": [
+    {"id": "read_after_commit", "mandatory": true, "description": "Committed writes are visible to later reads"},
+    {"id": "rollback", "mandatory": true, "description": "Rolled-back writes do not change persistent state"},
+    {"id": "errors", "mandatory": true, "description": "Not-found, malformed input and storage errors keep distinct outcomes"}
+  ],
+  "resolution": {
+    "state": "unresolved",
+    "allowed_strategies": ["direct_replace", "adapter", "compose_rust_libraries", "port_dependency", "temporary_ffi", "blocked"],
+    "selected_candidate": null,
+    "candidate_requirements": ["pinned_version", "source_and_docs", "license_and_target", "api_mapping", "behavior_gaps", "adapter_tasks", "contract_test_results"],
+    "candidate_search": {"owner": "agent", "status": "pending"}
+  },
+  "verification": {
+    "state": "not_run",
+    "evidence": [],
+    "acceptance": "Every mandatory contract must pass executable tests against the pinned source usage and replacement candidate",
+    "completion_allowed": false
+  },
+  "next_actions": [
+    "Collect real source usage and close inventory gaps",
+    "Search and inspect Rust candidates for the required contracts",
+    "Record exact versions, API mappings and missing behavior",
+    "Implement an adapter, composition or dependency port as needed",
+    "Execute source/replacement contract tests before acceptance"
+  ]
+}
