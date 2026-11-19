@@ -203,6 +203,7 @@ def main():
     parser.add_argument("--min-units", type=int, default=1000)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--no-rustc", action="store_true")
+    parser.add_argument("--profile", choices=["strict", "general"], default="strict")
     parser.add_argument("--out", type=Path, default=ROOT / ".reforge-demo/clang-benchmark-report.json")
     args = parser.parse_args()
 
@@ -213,6 +214,7 @@ def main():
     manifest = {
         "jobs": jobs,
         "compile_rustc": not args.no_rustc,
+        "profile": args.profile,
         "out_dir": str(work_dir / "rust-out"),
     }
     if args.workers > 0:
@@ -245,6 +247,7 @@ def main():
             c["rustc_nostd_ok"] += 1
 
     print("\n=== Reforge-MCP 1,000+ C Benchmark Summary ===")
+    print(f"Profile          : {report.get('profile', args.profile)}")
     print(f"Total units      : {report['total_units']}")
     print(f"Clang AST OK     : {report['clang_ok']} ({100.0 * report['clang_ok'] / max(1, report['total_units']):.1f}%)")
     print(f"Translated OK    : {report['translated_ok']} (+ {report['translated_empty']} empty/decl-only)")

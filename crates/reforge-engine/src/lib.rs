@@ -24,9 +24,9 @@ use model::{
 };
 use store::Store;
 
-pub use clang::TranslationUnitOutput;
+pub use clang::{TranslateOptions, TranslationUnitOutput};
 
-const RUST_PRELUDE: &str = "#![allow(unused_mut, unused_parens, unreachable_code, non_camel_case_types, non_snake_case, dead_code, unused_unsafe, unused_labels, improper_ctypes, improper_ctypes_definitions)]\n#[inline]\nfn rf_ptr<T>(ptr: *mut T) -> *mut T {\n    assert!(!ptr.is_null(), \"null pointer dereference\");\n    ptr\n}\n";
+const RUST_PRELUDE: &str = "#![allow(unused_mut, unused_parens, unreachable_code, non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, unused_unsafe, unused_labels, improper_ctypes, improper_ctypes_definitions)]\n#[inline]\nfn rf_ptr<T>(ptr: *mut T) -> *mut T {\n    assert!(!ptr.is_null(), \"null pointer dereference\");\n    ptr\n}\n";
 
 pub fn translate_ast(
     ast: &serde_json::Value,
@@ -34,6 +34,15 @@ pub fn translate_ast(
     root: &Path,
 ) -> Result<TranslationUnitOutput> {
     clang::translate(ast, translation_unit, root)
+}
+
+pub fn translate_ast_with_options(
+    ast: &serde_json::Value,
+    translation_unit: &Path,
+    root: &Path,
+    options: TranslateOptions,
+) -> Result<TranslationUnitOutput> {
+    clang::translate_with_options(ast, translation_unit, root, options)
 }
 
 pub fn render_rust_module(

@@ -14,11 +14,17 @@ struct Manifest {
     workers: Option<usize>,
     #[serde(default = "default_true")]
     compile_rustc: bool,
+    #[serde(default = "default_profile")]
+    profile: String,
     out_dir: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_profile() -> String {
+    "strict".into()
 }
 
 #[derive(Deserialize)]
@@ -50,6 +56,7 @@ struct BlockerBucket {
 
 #[derive(Serialize)]
 struct BenchSummary {
+    profile: String,
     total_units: usize,
     clang_ok: usize,
     translated_ok: usize,
@@ -153,7 +160,13 @@ fn sort_buckets(
     items
 }
 
-fn run_one(idx: usize, job: &BenchJob, out_dir: &Path, compile_rustc: bool) -> UnitResult {
+fn run_one(
+    idx: usize,
+    job: &BenchJob,
+    out_dir: &Path,
+    compile_rustc: bool,
+    options: reforge_engine::TranslateOptions,
+) -> UnitResult {
     let clang_out = match Command::new("clang").args(&job.args).output() {
         Ok(o) => o,
         Err(e) => {
@@ -200,8 +213,12 @@ fn run_one(idx: usize, job: &BenchJob, out_dir: &Path, compile_rustc: bool) -> U
         }
     };
 
-    let unit = match reforge_engine::translate_ast(&ast, Path::new(&job.file), Path::new(&job.root))
-    {
+    let unit = match reforge_engine::translate_ast_with_options(
+        &ast,
+        Path::new(&job.file),
+        Path::new(&job.root),
+        options,
+    ) {
         Ok(u) => u,
         Err(e) => {
             return UnitResult {
@@ -335,6 +352,12 @@ fn main() -> Result<()> {
     let out_dir = PathBuf::from(&manifest.out_dir);
     std::fs::create_dir_all(&out_dir)?;
 
+    let options = match manifest.profile.as_str() {
+        "strict" => reforge_engine::TranslateOptions::strict(),
+        "general" => reforge_engine::TranslateOptions::general_c(),
+        other => anyhow::bail!("unknown benchmark profile {other:?} (expected strict or general)"),
+    };
+
     let workers = manifest.workers.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -353,7 +376,13 @@ fn main() -> Result<()> {
                     if i >= total {
                         break;
                     }
-                    let res = run_one(i, &manifest.jobs[i], &out_dir, manifest.compile_rustc);
+                    let res = run_one(
+                        i,
+                        &manifest.jobs[i],
+                        &out_dir,
+                        manifest.compile_rustc,
+                        options,
+                    );
                     collected.lock().unwrap()[i] = Some(res);
                 }
             });
@@ -417,6 +446,7 @@ fn main() -> Result<()> {
     }
 
     let summary = BenchSummary {
+        profile: manifest.profile,
         total_units: results.len(),
         clang_ok,
         translated_ok,

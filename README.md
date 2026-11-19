@@ -137,24 +137,48 @@ python3 scripts/campaign_smoke.py
 
 ### 1,000+ C Unit Clang Benchmark
 
-Run the multi-threaded Clang AST + deterministic translator + `rustc #![no_std]` corpus profiler:
+Run the multi-threaded Clang AST + deterministic translator + `rustc #![no_std]` corpus profiler in either `strict` (default fail-closed profile) or `general` (`TranslateOptions::general_c()`) mode:
 
 ```bash
-python3 scripts/clang_benchmark.py
+python3 scripts/clang_benchmark.py                    # strict profile (default)
+python3 scripts/clang_benchmark.py --profile general  # general-purpose C profile
 ```
 
 By default `scripts/clang_benchmark.py` discovers real C translation units across `fixtures/porting/` and any locally checked-out `vendor/` reference corpora (`c2rust`, `crown`, `c2saferrust`/Laertes, `musl`, `zopfli`), falling back to synthetic C units when `--min-units 1000` is not yet reached, and writes `.reforge-demo/clang-benchmark-report.json`.
 
 Measured across **1,690 real C translation units** (`1,383` musl, `191` Crown, `100` C2Rust unit tests, `10` Laertes, `5` fixtures, `1` Zopfli):
 
-| Stage | Baseline | After Blocker Fixes |
+| Stage | Strict Profile | General Profile (`--profile general`) |
 |---|---|---|
-| Clang AST Parsed (`-ast-dump=json`) | 1,142 / 1,690 (67.6%) | **1,668 / 1,690 (98.7%)** |
-| Translated Units (non-empty) | 99 (+ 7 empty) | **499 (+ 20 empty)** |
-| `rustc --edition=2024` `#![no_std]` Compiled | 36 (36.4% of translated) | **499 (100.0% of translated)** |
-| Translated Functions (`rf_safe_*` wrappers) | 166 (31) | **2,308 (458)** |
+| Clang AST Parsed (`-ast-dump=json`) | 1,668 / 1,690 (98.7%) | 1,668 / 1,690 (98.7%) |
+| Translated Units (non-empty) | **504** (+ 20 empty) | **689** (+ 26 empty) |
+| `rustc --edition=2024` `#![no_std]` Compiled | **504 (100.0% of translated)** | **689 (100.0% of translated)** |
+| Translated Functions (`rf_safe_*` wrappers) | **2,334 (467)** | **3,992 (964)** |
 
-Remaining translation rejections in the benchmark reflect intentional fail-closed policies (`static` mutable locals, non-const globals, `GCCAsmStmt` inline assembly, variadic definitions, `main`, `__uint128_t`, `__builtin_va_list`, backward/cross-scope `goto`).
+Under `--profile general` (including 10/10 Laertes, 72/89 C2Rust unit tests, 104/181 Crown, and 498/1,383 musl), remaining rejections are primarily multi-variable declaration lists / unsupported attributes, `GCCAsmStmt` inline assembly, `__builtin_va_list`, and external incomplete system structs (`struct stat`, `z_t`). Strict mode continues to reject mutable `static`/global state, uninitialized scalars, variadic calls, `main`, and arbitrary CFG `goto`/Duff's device by design.
+
+### Real Open-Source E2E Porting & Native Test Suite Benchmark
+
+Translate whole real open-source C libraries with `TranslateOptions::drop_in_c_abi()`, compile each multi-TU project into a native Rust `.a` static library (or pure Rust binary) with `rustc --edition=2024 -O`, link unmodified upstream C/C++ test suites directly against the Rust output, and verify behavior parity against C baselines:
+
+```bash
+python3 scripts/oss_e2e_benchmark.py
+```
+
+Measured across **10 real open-source C projects** (**28 C translation units**, **557 translated functions**):
+
+| Project | TUs | Functions | Output | Native Upstream Suite Verification |
+|---|---:|---:|---|---|
+| `ht` | 1/1 | 10 | `libht_rs.a` | Unmodified `samples/demo.c` linked & matched C stdout (exit 0) |
+| `quadtree` | 4/4 | 24 | `libquadtree_rs.a` | Unmodified `test.c` linked (`-lm`) & matched C stdout (exit 0) |
+| `urlparser` | 1/1 | 21 | `urlparser_rs` (bin) | Pure Rust binary matches C baseline (`c_exit == rs_exit == -11`, `stdout_match: True`; upstream `url.h:191` `malloc(1)` heap overflow traps identically in C and Rust) |
+| `rgba` | 1/1 | 13 | `librgba_rs.a` | Unmodified `test.c` linked & matched C stdout (exit 0) |
+| `libcsv` | 1/1 | 23 | `libcsv_rs.a` | Unmodified `test_csv.c` linked & matched (`All tests passed`, exit 0) |
+| `lodepng` | 1/1 | 235 | `liblodepng_rs.a` | `example_encode.c` + `example_decode.c` linked; 10,622-byte PNG byte-identical to C baseline (exit 0) |
+| `genann` | 1/1 | 15 | `libgenann_rs.a` | Unmodified `c/test.c` linked (`-lm`) (`ALL TESTS PASSED (521556/521556)`, exit 0) |
+| `bzip2` | 7/7 | 64 | `libbzip2_rs.a` | Unmodified `bzip2.c` CLI linked; 6/6 upstream `sample1/2/3` compress & decompress `cmp` checks passed |
+| `zlib` (`Z_SOLO`) | 9/9 | 99 | `libzlib_rs.a` | Unmodified `test/example.c` (`-DZ_SOLO`) linked without `-lz` & matched C stdout (exit 0) |
+| `json.h` | 1/1 | 53 | `libjson_h_rs.a` | Strong `T _json_parse` linked via whole-archive override; `508/508` C/C++ JSONTestSuite tests passed (exit 0) |
 
 ---
 

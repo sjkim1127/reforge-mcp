@@ -124,24 +124,48 @@ python3 scripts/campaign_smoke.py
 
 ### 1,000+ C 유닛 Clang 벤치마크
 
-대규모 실제 C 프로젝트에서 막히는 구문과 `#![no_std]` 컴파일 성공률을 프로파일링하려면 아래 명령을 실행합니다.
+대규모 실제 C 프로젝트에서 `strict`(기본 fail-closed 프로파일) 및 `general`(`TranslateOptions::general_c()`) 모드별 번역·`#![no_std]` 컴파일 성공률과 블로커를 프로파일링하려면 아래 명령을 실행합니다.
 
 ```bash
-python3 scripts/clang_benchmark.py
+python3 scripts/clang_benchmark.py                    # strict 프로파일 (기본값)
+python3 scripts/clang_benchmark.py --profile general  # 범용 C 프로파일
 ```
 
-`scripts/clang_benchmark.py`는 `fixtures/porting/` 및 로컬 `vendor/` 참고 코퍼스(`musl`, `crown`, `c2rust`, `c2saferrust`/Laertes, `zopfli`)에서 실제 C 번역 단위를 수집하고(`--min-units 1000` 미만 시 합성 C 유닛으로 보충), 다중 스레드로 Clang JSON AST 덤프, `reforge_engine::translate_ast` 번역, `rustc --edition=2024` `#![no_std]` 빌드를 검증해 `.reforge-demo/clang-benchmark-report.json`을 생성합니다.
+`scripts/clang_benchmark.py`는 `fixtures/porting/` 및 로컬 `vendor/` 참고 코퍼스(`musl`, `crown`, `c2rust`, `c2saferrust`/Laertes, `zopfli`)에서 실제 C 번역 단위를 수집하고(`--min-units 1000` 미만 시 합성 C 유닛으로 보충), 다중 스레드로 Clang JSON AST 덤프, `reforge_engine::translate_ast_with_options` 번역, `rustc --edition=2024` `#![no_std]` 빌드를 검증해 `.reforge-demo/clang-benchmark-report.json`을 생성합니다.
 
 **1,690개 실제 C 번역 단위**(`musl` 1,383, `crown` 191, `c2rust-unit` 100, `laertes` 10, `fixtures` 5, `zopfli` 1) 기준 실측 결과:
 
-| 단계 | 초기 기준선 | 블로커 개선 후 |
+| 단계 | `strict` 프로파일 | `general` 프로파일 (`--profile general`) |
 |---|---|---|
-| Clang AST 파싱 성공 | 1,142 / 1,690 (67.6%) | **1,668 / 1,690 (98.7%)** |
-| 번역 성공 유닛 (비어 있지 않음) | 99 (+ 7 empty) | **499 (+ 20 empty)** |
-| `rustc --edition=2024` `#![no_std]` 컴파일 성공 | 36 (번역 유닛 중 36.4%) | **499 (번역 유닛 100.0%)** |
-| 번역된 함수 수 (`rf_safe_*` 래퍼) | 166 (31) | **2,308 (458)** |
+| Clang AST 파싱 성공 | 1,668 / 1,690 (98.7%) | 1,668 / 1,690 (98.7%) |
+| 번역 성공 유닛 (비어 있지 않음) | **504** (+ 20 empty) | **689** (+ 26 empty) |
+| `rustc --edition=2024` `#![no_std]` 컴파일 성공 | **504 (번역 유닛 100.0%)** | **689 (번역 유닛 100.0%)** |
+| 번역된 함수 수 (`rf_safe_*` 래퍼) | **2,334 (467)** | **3,992 (964)** |
 
-남은 번역 거부는 가변 `static` 지역 변수, 비상수 전역 변수, 인라인 어셈블리(`GCCAsmStmt`), 가변인자 함수 본문, `main`, `__uint128_t`, `__builtin_va_list`, 역방향 `goto` 등 의도된 fail-closed 정책에 해당합니다.
+`--profile general`에서는 Laertes `10/10`, C2Rust 유닛 테스트 `72/89`, Crown `104/181`, musl `498/1,383`이 통과하며, 남은 거부는 다중 변수 선언 목록/미지원 속성, 인라인 어셈블리(`GCCAsmStmt`), `__builtin_va_list`, 미정의 외부 시스템 구조체(`struct stat`, `z_t`) 등에 집중됩니다. 기본 `strict` 프로파일은 가변 `static`/전역 변수, 미초기화 스칼라 읽기, 가변인자 호출, `main`, 일반 CFG `goto`/Duff's device를 계속 fail-closed로 거부합니다.
+
+### 실제 오픈소스 E2E 포팅 & 원본 테스트 스위트 벤치마크
+
+실제 소·중형 오픈소스 C 프로젝트 전체를 `TranslateOptions::drop_in_c_abi()`로 번역하고 `rustc --edition=2024 -O`로 정적 라이브러리(`.a`) 또는 순수 Rust 실행 바이너리로 빌드한 뒤, 수정 없는 원본 C/C++ 테스트 스위트에 직접 링크해 C 기준선과 동작 일치 여부를 검증합니다.
+
+```bash
+python3 scripts/oss_e2e_benchmark.py
+```
+
+**10개 실제 오픈소스 C 프로젝트**(**28개 번역 단위**, **557개 번역 함수**) 실측 결과:
+
+| 프로젝트 | 번역 단위 | 함수 수 | 산출물 | 원본 테스트 스위트 검증 결과 |
+|---|---:|---:|---|---|
+| `ht` | 1/1 | 10 | `libht_rs.a` | 원본 `samples/demo.c` 링크 후 stdin 입력 stdout C 기준선과 완전 일치 (exit 0) |
+| `quadtree` | 4/4 | 24 | `libquadtree_rs.a` | 원본 `test.c` 링크(`-lm`) 후 stdout C 기준선과 완전 일치 (exit 0) |
+| `urlparser` | 1/1 | 21 | `urlparser_rs` (실행 파일) | 순수 Rust 실행 파일이 C 기준선과 동일 종료코드/출력 (`c_exit == rs_exit == -11`, `stdout_match: True`; 원본 `url.h:191` `malloc(1)` 힙 버퍼 오버플로 UB가 C/Rust 모두에서 동일 트랩) |
+| `rgba` | 1/1 | 13 | `librgba_rs.a` | 원본 `test.c` 링크 후 stdout C 기준선과 완전 일치 (exit 0) |
+| `libcsv` | 1/1 | 23 | `libcsv_rs.a` | 원본 `test_csv.c` 링크 후 `All tests passed` 통과 (exit 0) |
+| `lodepng` | 1/1 | 235 | `liblodepng_rs.a` | `example_encode.c` / `example_decode.c` 링크 후 생성 10,622바이트 PNG 바이트 단위 C 기준선과 일치 (exit 0) |
+| `genann` | 1/1 | 15 | `libgenann_rs.a` | 원본 `c/test.c` 링크(`-lm`) 후 `ALL TESTS PASSED (521556/521556)` 통과 (exit 0) |
+| `bzip2` | 7/7 | 64 | `libbzip2_rs.a` | 원본 `bzip2.c` CLI 링크 후 `sample1/2/3` 압축·해제 바이트 대조 `cmp` 6/6 통과 |
+| `zlib` (`Z_SOLO`) | 9/9 | 99 | `libzlib_rs.a` | `-lz` 없이 원본 `test/example.c` (`-DZ_SOLO`) 링크 후 stdout C 기준선과 일치 (exit 0) |
+| `json.h` | 1/1 | 53 | `libjson_h_rs.a` | 강한 심볼 `T _json_parse` whole-archive 링크 후 C/C++ JSONTestSuite `508/508` 테스트 통과 (exit 0) |
 
 ## 전환 및 호환성
 

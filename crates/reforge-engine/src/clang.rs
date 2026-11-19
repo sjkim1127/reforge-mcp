@@ -17,6 +17,70 @@ pub struct TranslationUnitOutput {
     pub prototypes: Vec<ExternalFunction>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TranslateOptions {
+    pub allow_variadic_calls: bool,
+    pub allow_mutable_globals: bool,
+    pub allow_mutable_static_locals: bool,
+    pub allow_main: bool,
+    pub allow_uninit_locals: bool,
+    pub allow_general_cfg: bool,
+    pub export_c_symbols: bool,
+}
+
+impl TranslateOptions {
+    pub const fn strict() -> Self {
+        Self {
+            allow_variadic_calls: false,
+            allow_mutable_globals: false,
+            allow_mutable_static_locals: false,
+            allow_main: false,
+            allow_uninit_locals: false,
+            allow_general_cfg: false,
+            export_c_symbols: false,
+        }
+    }
+
+    pub const fn general_c() -> Self {
+        Self {
+            allow_variadic_calls: true,
+            allow_mutable_globals: true,
+            allow_mutable_static_locals: true,
+            allow_main: true,
+            allow_uninit_locals: true,
+            allow_general_cfg: true,
+            export_c_symbols: false,
+        }
+    }
+
+    pub const fn drop_in_c_abi() -> Self {
+        Self {
+            allow_variadic_calls: true,
+            allow_mutable_globals: true,
+            allow_mutable_static_locals: true,
+            allow_main: true,
+            allow_uninit_locals: true,
+            allow_general_cfg: true,
+            export_c_symbols: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalKind {
+    StaticConst,
+    ConstItem,
+    StaticMut,
+}
+
+#[derive(Debug, Clone)]
+struct GlobalBinding {
+    rust_name: String,
+    c_name: String,
+    ty: CType,
+    kind: GlobalKind,
+}
+
 type StructFieldsMap = BTreeMap<String, Vec<(String, CType, Option<u32>)>>;
 type UnionFieldsMap = BTreeMap<String, Vec<(String, CType)>>;
 type LabeledSegment<'a> = (Option<(String, String)>, Vec<&'a Value>);
@@ -35,13 +99,21 @@ enum IntKind {
     ULong,
     LongLong,
     ULongLong,
+    I128,
+    U128,
 }
 
 impl IntKind {
     fn is_signed(self) -> bool {
         match self {
-            Self::Bool | Self::U8 | Self::U16 | Self::U32 | Self::ULong | Self::ULongLong => false,
-            Self::I8 | Self::I16 | Self::I32 | Self::Long | Self::LongLong => true,
+            Self::Bool
+            | Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::ULong
+            | Self::ULongLong
+            | Self::U128 => false,
+            Self::I8 | Self::I16 | Self::I32 | Self::Long | Self::LongLong | Self::I128 => true,
             Self::Char => !cfg!(all(
                 target_os = "linux",
                 any(target_arch = "aarch64", target_arch = "arm")
@@ -55,6 +127,7 @@ impl IntKind {
             Self::I16 | Self::U16 => 16,
             Self::I32 | Self::U32 => 32,
             Self::Long | Self::ULong | Self::LongLong | Self::ULongLong => 64,
+            Self::I128 | Self::U128 => 128,
         }
     }
 
@@ -63,7 +136,8 @@ impl IntKind {
             8 => "u8",
             16 => "u16",
             32 => "u32",
-            _ => "u64",
+            64 => "u64",
+            _ => "u128",
         }
     }
 
@@ -84,6 +158,8 @@ impl IntKind {
             Self::U32 => "u32",
             Self::Long | Self::LongLong => "i64",
             Self::ULong | Self::ULongLong => "u64",
+            Self::I128 => "i128",
+            Self::U128 => "u128",
         }
     }
 
@@ -101,6 +177,8 @@ impl IntKind {
             Self::ULong => "unsigned long",
             Self::LongLong => "long long",
             Self::ULongLong => "unsigned long long",
+            Self::I128 => "__int128",
+            Self::U128 => "unsigned __int128",
         }
     }
 }
@@ -463,6 +541,8 @@ fn parse_int_kind(base: &str) -> Option<IntKind> {
         | "int64_t"
         | "s64" => IntKind::LongLong,
         "unsigned long long" | "unsigned long long int" | "uint64_t" | "u64" => IntKind::ULongLong,
+        "__int128" | "__int128_t" | "int128_t" => IntKind::I128,
+        "unsigned __int128" | "__uint128_t" | "uint128_t" => IntKind::U128,
         _ => return None,
     })
 }
@@ -549,18 +629,27 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     result
 }
 
-fn parse_param_list(
+fn parse_param_list_with_variadic(
     params_str: &str,
     typedefs: &BTreeMap<String, String>,
     depth: usize,
-) -> Result<Vec<CType>> {
+) -> Result<(Vec<CType>, bool)> {
     let trimmed = params_str.trim();
     if trimmed.is_empty() || trimmed == "void" {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
-    let mut params = Vec::new();
-    for p in split_top_level_commas(trimmed) {
-        ensure!(p != "...", "variadic functions are unsupported");
+    let items = split_top_level_commas(trimmed);
+    let mut params = Vec::with_capacity(items.len());
+    let mut is_variadic = false;
+    for (idx, p) in items.iter().enumerate() {
+        if *p == "..." {
+            ensure!(
+                idx + 1 == items.len(),
+                "variadic ellipsis must be last parameter"
+            );
+            is_variadic = true;
+            break;
+        }
         let pty = match CType::parse_str_depth(p, typedefs, depth) {
             Ok(t) => t,
             Err(orig_err) => {
@@ -578,6 +667,16 @@ fn parse_param_list(
         ensure!(!matches!(pty, CType::Void), "void parameter unsupported");
         params.push(pty);
     }
+    Ok((params, is_variadic))
+}
+
+fn parse_param_list(
+    params_str: &str,
+    typedefs: &BTreeMap<String, String>,
+    depth: usize,
+) -> Result<Vec<CType>> {
+    let (params, is_variadic) = parse_param_list_with_variadic(params_str, typedefs, depth)?;
+    ensure!(!is_variadic, "variadic functions are unsupported");
     Ok(params)
 }
 
@@ -947,15 +1046,24 @@ fn collect_enum_decl(
     }
 }
 
-fn parse_fn_signature(
+fn parse_fn_signature_variadic(
     qual_type: &str,
     typedefs: &BTreeMap<String, String>,
-) -> Result<(Vec<CType>, CType)> {
+) -> Result<(Vec<CType>, CType, bool)> {
     let clean = strip_trailing_qualifiers(qual_type);
     let (ret_str, params_str) = split_trailing_parens(clean)
         .with_context(|| format!("invalid function type {qual_type:?}"))?;
     let ret = CType::parse_str(ret_str, typedefs)?;
-    let params = parse_param_list(params_str, typedefs, 0)?;
+    let (params, is_variadic) = parse_param_list_with_variadic(params_str, typedefs, 0)?;
+    Ok((params, ret, is_variadic))
+}
+
+fn parse_fn_signature(
+    qual_type: &str,
+    typedefs: &BTreeMap<String, String>,
+) -> Result<(Vec<CType>, CType)> {
+    let (params, ret, is_variadic) = parse_fn_signature_variadic(qual_type, typedefs)?;
+    ensure!(!is_variadic, "variadic functions are unsupported");
     Ok((params, ret))
 }
 
@@ -974,7 +1082,7 @@ fn make_external_function(name: &str, param_types: &[CType], ret: &CType) -> Ext
         format!(" -> {}", ret.rust_type())
     };
     let rust = format!(
-        "unsafe extern \"C\" {{\n    fn {name}({}){ret_suffix};\n}}\n#[inline]\npub extern \"C\" fn rf_{name}({}){ret_suffix} {{\n    unsafe {{ {name}({}) }}\n}}\n",
+        "unsafe extern \"C\" {{\n    #[link_name = \"{name}\"]\n    fn rf_ext_{name}({}){ret_suffix};\n}}\n#[inline]\npub extern \"C\" fn rf_{name}({}){ret_suffix} {{\n    unsafe {{ rf_ext_{name}({}) }}\n}}\n",
         params_rust.join(", "),
         params_rust.join(", "),
         args_rust.join(", "),
@@ -985,6 +1093,58 @@ fn make_external_function(name: &str, param_types: &[CType], ret: &CType) -> Ext
         return_type: ret.c_type(),
         rust,
     }
+}
+
+fn make_external_variadic_function(
+    name: &str,
+    fixed_params: &[CType],
+    ret: &CType,
+) -> ExternalFunction {
+    let params_rust = fixed_params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("v{i}: {}", t.rust_type()))
+        .collect::<Vec<_>>();
+    let fixed_str = params_rust.join(", ");
+    let sig = if fixed_str.is_empty() {
+        "...".to_owned()
+    } else {
+        format!("{fixed_str}, ...")
+    };
+    let ret_suffix = if matches!(ret, CType::Void) {
+        String::new()
+    } else {
+        format!(" -> {}", ret.rust_type())
+    };
+    let rust = format!(
+        "unsafe extern \"C\" {{\n    #[link_name = \"{name}\"]\n    fn rf_var_{name}({sig}){ret_suffix};\n}}\n",
+    );
+    ExternalFunction {
+        name: name.to_owned(),
+        parameter_types: fixed_params.iter().map(CType::c_type).collect(),
+        return_type: ret.c_type(),
+        rust,
+    }
+}
+
+fn promote_variadic_arg(expr: String, ty: &CType) -> Result<String> {
+    ensure!(
+        !matches!(ty, CType::Void),
+        "cannot pass void value as variadic argument"
+    );
+    Ok(match ty {
+        CType::Int(IntKind::Bool | IntKind::I8 | IntKind::I16) => format!("(({expr}) as i32)"),
+        CType::Int(IntKind::Char) => {
+            if IntKind::Char.is_signed() {
+                format!("(({expr}) as i32)")
+            } else {
+                format!("(({expr}) as u32)")
+            }
+        }
+        CType::Int(IntKind::U8 | IntKind::U16) => format!("(({expr}) as u32)"),
+        CType::Float(FloatKind::F32) => format!("(({expr}) as f64)"),
+        _ => expr,
+    })
 }
 
 fn eval_constant_int(node: &Value) -> Option<i64> {
@@ -1186,7 +1346,11 @@ struct PtrUsage {
 fn unwrap_paren_cast(mut node: &Value) -> &Value {
     while matches!(
         kind(node),
-        "ParenExpr" | "ImplicitCastExpr" | "CStyleCastExpr"
+        "ParenExpr"
+            | "ImplicitCastExpr"
+            | "CStyleCastExpr"
+            | "ExprWithCleanups"
+            | "MaterializeTemporaryExpr"
     ) {
         if let Some(ch) = children(node).first() {
             node = ch;
@@ -1709,6 +1873,15 @@ pub fn translate(
     translation_unit: &Path,
     root: &Path,
 ) -> Result<TranslationUnitOutput> {
+    translate_with_options(ast, translation_unit, root, TranslateOptions::strict())
+}
+
+pub fn translate_with_options(
+    ast: &Value,
+    translation_unit: &Path,
+    root: &Path,
+    options: TranslateOptions,
+) -> Result<TranslationUnitOutput> {
     let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let root = root_canon.as_path();
     ensure!(
@@ -1846,11 +2019,20 @@ pub fn translate(
         )?;
     }
 
-    // Pass 2: collect static const globals, translate project functions, and collect prototypes.
-    let mut constants = Vec::new();
-    let mut const_globals: BTreeMap<String, (String, CType, bool)> = BTreeMap::new();
+    // Pass 2: collect globals, translate project functions, and collect prototypes.
+    let mut constants: Vec<String> = Vec::new();
+    let mut global_defs_rust: Vec<Option<String>> = Vec::new();
+    let mut defined_global_slots: BTreeMap<String, (usize, bool)> = BTreeMap::new();
+    let mut extern_globals: BTreeMap<String, (String, CType)> = BTreeMap::new();
+    let mut global_bindings: BTreeMap<String, GlobalBinding> = BTreeMap::new();
+    let mut global_id_to_name: BTreeMap<String, String> = BTreeMap::new();
+    let mut referenced_globals: BTreeSet<String> = BTreeSet::new();
+    let mut used_fn_deps: BTreeSet<String> = BTreeSet::new();
     let mut unsupported_globals: BTreeMap<String, String> = BTreeMap::new();
-    let mut variadic_prototypes: BTreeSet<String> = BTreeSet::new();
+    let mut variadic_prototypes: BTreeMap<
+        String,
+        std::result::Result<(Vec<CType>, CType), String>,
+    > = BTreeMap::new();
     let mut unsupported_prototypes: BTreeMap<String, String> = BTreeMap::new();
     let mut functions = Vec::new();
     let mut prototypes: BTreeMap<String, ExternalFunction> = BTreeMap::new();
@@ -1867,30 +2049,61 @@ pub fn translate(
         let in_project = physical_file.starts_with(root);
 
         if !in_project {
-            if kind(node) == "FunctionDecl"
-                && !children(node).iter().any(|n| kind(n) == "CompoundStmt")
-            {
-                let name = text(node, "name");
-                if identifier(name).is_ok() {
-                    if node["variadic"].as_bool().unwrap_or(false) {
-                        variadic_prototypes.insert(name.to_owned());
-                    } else {
-                        match parse_fn_signature(text(&node["type"], "qualType"), &typedefs) {
-                            Ok((param_types, ret_type)) => {
-                                variadic_prototypes.remove(name);
-                                unsupported_prototypes.remove(name);
-                                prototypes.entry(name.to_owned()).or_insert_with(|| {
-                                    make_external_function(name, &param_types, &ret_type)
-                                });
-                            }
-                            Err(err) => {
-                                unsupported_prototypes
-                                    .entry(name.to_owned())
-                                    .or_insert_with(|| err.to_string());
+            match kind(node) {
+                "FunctionDecl" if !children(node).iter().any(|n| kind(n) == "CompoundStmt") => {
+                    let name = text(node, "name");
+                    if identifier(name).is_ok() {
+                        if node["variadic"].as_bool().unwrap_or(false) {
+                            let parsed = parse_fn_signature_variadic(
+                                text(&node["type"], "qualType"),
+                                &typedefs,
+                            )
+                            .map(|(p, r, _)| (p, r))
+                            .map_err(|e| e.to_string());
+                            variadic_prototypes.insert(name.to_owned(), parsed);
+                        } else {
+                            match parse_fn_signature(text(&node["type"], "qualType"), &typedefs) {
+                                Ok((param_types, ret_type)) => {
+                                    variadic_prototypes.remove(name);
+                                    unsupported_prototypes.remove(name);
+                                    prototypes.entry(name.to_owned()).or_insert_with(|| {
+                                        make_external_function(name, &param_types, &ret_type)
+                                    });
+                                }
+                                Err(err) => {
+                                    unsupported_prototypes
+                                        .entry(name.to_owned())
+                                        .or_insert_with(|| err.to_string());
+                                }
                             }
                         }
                     }
                 }
+                "VarDecl" if options.allow_mutable_globals => {
+                    let gname = text(node, "name");
+                    if text(node, "storageClass") == "extern"
+                        && identifier(gname).is_ok()
+                        && let Ok(gty) = CType::from_node_type(&node["type"], &typedefs)
+                        && !matches!(gty, CType::Void)
+                    {
+                        global_id_to_name.insert(text(node, "id").to_owned(), gname.to_owned());
+                        if !defined_global_slots.contains_key(gname) {
+                            let rust_name = format!("RF_GLOBAL_{gname}");
+                            extern_globals
+                                .entry(gname.to_owned())
+                                .or_insert_with(|| (rust_name.clone(), gty.clone()));
+                            global_bindings
+                                .entry(gname.to_owned())
+                                .or_insert(GlobalBinding {
+                                    rust_name,
+                                    c_name: gname.to_owned(),
+                                    ty: gty,
+                                    kind: GlobalKind::StaticMut,
+                                });
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -1906,13 +2119,38 @@ pub fn translate(
             "VarDecl" => {
                 let gname = text(node, "name");
                 identifier(gname)?;
+                let id = text(node, "id").to_owned();
                 let value_children: Vec<_> = children(node)
                     .iter()
                     .filter(|c| !is_benign_attr_or_comment(kind(c)))
                     .collect();
                 let storage_class = text(node, "storageClass");
+                let is_const = is_const_qualified(&node["type"]);
                 if storage_class == "extern" && value_children.is_empty() {
-                    if is_const_qualified(&node["type"])
+                    if options.allow_mutable_globals {
+                        if let Ok(gty) = CType::from_node_type(&node["type"], &typedefs)
+                            && !matches!(gty, CType::Void)
+                        {
+                            global_id_to_name.insert(id, gname.to_owned());
+                            if !defined_global_slots.contains_key(gname) {
+                                let rust_name = format!("RF_GLOBAL_{gname}");
+                                extern_globals
+                                    .entry(gname.to_owned())
+                                    .or_insert_with(|| (rust_name.clone(), gty.clone()));
+                                global_bindings
+                                    .entry(gname.to_owned())
+                                    .or_insert(GlobalBinding {
+                                        rust_name,
+                                        c_name: gname.to_owned(),
+                                        ty: gty,
+                                        kind: GlobalKind::StaticMut,
+                                    });
+                            }
+                        } else {
+                            unsupported_globals
+                                .insert(id, format!("external global {gname} is unsupported"));
+                        }
+                    } else if is_const
                         && let Ok(gty) = CType::from_node_type(&node["type"], &typedefs)
                         && !matches!(gty, CType::Void | CType::Array(_, 0))
                     {
@@ -1921,69 +2159,161 @@ pub fn translate(
                         constants.push(format!(
                             "unsafe extern \"C\" {{\n    #[link_name = \"{gname}\"]\n    pub static {rust_name}: {rty};\n}}\n"
                         ));
-                        const_globals.insert(text(node, "id").to_owned(), (rust_name, gty, false));
-                    } else {
-                        unsupported_globals.insert(
-                            text(node, "id").to_owned(),
-                            format!("external global {gname} is unsupported"),
+                        global_id_to_name.insert(id, gname.to_owned());
+                        global_bindings.insert(
+                            gname.to_owned(),
+                            GlobalBinding {
+                                rust_name,
+                                c_name: gname.to_owned(),
+                                ty: gty,
+                                kind: GlobalKind::ConstItem,
+                            },
                         );
+                    } else {
+                        unsupported_globals
+                            .insert(id, format!("external global {gname} is unsupported"));
                     }
                     continue;
                 }
-                ensure!(
-                    is_const_qualified(&node["type"]),
-                    "mutable global variable {gname} is unsupported"
-                );
-                ensure!(
-                    value_children.len() == 1,
-                    "const global {gname} must have an initializer"
-                );
-                let gty = CType::from_node_type(&node["type"], &typedefs)?;
-                let cur_clang_str = current_file.to_string_lossy().into_owned();
-                let mut temp_deps = prototypes.clone();
-                let mut temp_emitter = Emitter {
-                    variables: BTreeMap::new(),
-                    uninit_scalars: BTreeSet::new(),
-                    const_globals: Cow::Borrowed(&const_globals),
-                    unsupported_globals: Cow::Borrowed(&unsupported_globals),
-                    variadic_prototypes: &variadic_prototypes,
-                    unsupported_prototypes: &unsupported_prototypes,
-                    dependencies: BTreeSet::new(),
-                    next_variable: 0,
-                    loop_labels: Vec::new(),
-                    break_target: Vec::new(),
-                    forward_labels: BTreeMap::new(),
-                    return_type: CType::Void,
-                    typedefs: Cow::Borrowed(&typedefs),
-                    enum_constants: Cow::Borrowed(&enum_constants),
-                    structs: Cow::Borrowed(&structs_map),
-                    unions: Cow::Borrowed(&unions_map),
-                    structs_out: &mut structs,
-                    seen_records: &mut seen_records,
-                    anon_counter: &mut anon_counter,
-                    file_sources: &mut file_sources,
-                    current_rel_file: file,
-                    current_physical_file: &physical_file,
-                    current_clang_file: &cur_clang_str,
-                    current_source: "",
-                    prototypes: &mut temp_deps,
-                };
-                let (init_expr, init_ty) = temp_emitter.typed_expression(value_children[0])?;
-                ensure!(
-                    gty.same_shape(&init_ty),
-                    "const global {gname} initializer type mismatch"
-                );
-                let rust_name = format!("RF_CONST_{gname}");
-                let is_static = !gty.contains_raw_ptr(&structs_map, &unions_map);
-                let kw = if is_static { "pub static" } else { "pub const" };
-                let rty = gty.rust_type();
-                let val_block = if is_static {
-                    format!("unsafe {{ {init_expr} }}")
+                if !options.allow_mutable_globals {
+                    ensure!(is_const, "mutable global variable {gname} is unsupported");
+                    ensure!(
+                        value_children.len() == 1,
+                        "const global {gname} must have an initializer"
+                    );
                 } else {
-                    init_expr
+                    ensure!(
+                        value_children.len() <= 1,
+                        "global {gname} must have zero or one initializer"
+                    );
+                }
+                let gty = CType::from_node_type(&node["type"], &typedefs)?;
+                let is_tentative = value_children.is_empty();
+                let init_expr = if let Some(init_node) = value_children.first() {
+                    let cur_clang_str = current_file.to_string_lossy().into_owned();
+                    let mut temp_emitter = Emitter {
+                        variables: BTreeMap::new(),
+                        uninit_scalars: BTreeSet::new(),
+                        global_id_to_name: Cow::Borrowed(&global_id_to_name),
+                        global_bindings: Cow::Borrowed(&global_bindings),
+                        referenced_globals: BTreeSet::new(),
+                        unsupported_globals: Cow::Borrowed(&unsupported_globals),
+                        variadic_prototypes: &variadic_prototypes,
+                        unsupported_prototypes: &unsupported_prototypes,
+                        dependencies: BTreeSet::new(),
+                        next_variable: 0,
+                        loop_labels: Vec::new(),
+                        break_target: Vec::new(),
+                        forward_labels: BTreeMap::new(),
+                        return_type: CType::Void,
+                        typedefs: Cow::Borrowed(&typedefs),
+                        enum_constants: Cow::Borrowed(&enum_constants),
+                        structs: Cow::Borrowed(&structs_map),
+                        unions: Cow::Borrowed(&unions_map),
+                        structs_out: &mut structs,
+                        seen_records: &mut seen_records,
+                        anon_counter: &mut anon_counter,
+                        file_sources: &mut file_sources,
+                        current_rel_file: file,
+                        current_physical_file: &physical_file,
+                        current_clang_file: &cur_clang_str,
+                        current_source: "",
+                        prototypes: &mut prototypes,
+                        options,
+                    };
+                    let (expr, init_ty) = temp_emitter.typed_expression(init_node)?;
+                    ensure!(
+                        gty.same_shape(&init_ty),
+                        "global {gname} initializer type mismatch"
+                    );
+                    referenced_globals.extend(temp_emitter.referenced_globals);
+                    used_fn_deps.extend(temp_emitter.dependencies);
+                    expr
+                } else {
+                    gty.zero_expr(&structs_map)?
                 };
-                constants.push(format!("{kw} {rust_name}: {rty} = {val_block};\n"));
-                const_globals.insert(text(node, "id").to_owned(), (rust_name, gty, is_static));
+                let has_raw_ptr = gty.contains_raw_ptr(&structs_map, &unions_map);
+                let export_attr = if options.export_c_symbols && storage_class != "static" {
+                    format!("#[unsafe(export_name = \"{gname}\")]\n")
+                } else {
+                    String::new()
+                };
+                let (rust_name, kind_out, decl_str) = if !is_const || is_tentative {
+                    let rname = format!("RF_GLOBAL_{gname}");
+                    let rty = gty.rust_type();
+                    let vis = if storage_class == "static" {
+                        "static mut"
+                    } else {
+                        "pub static mut"
+                    };
+                    (
+                        rname.clone(),
+                        GlobalKind::StaticMut,
+                        format!("{export_attr}{vis} {rname}: {rty} = unsafe {{ {init_expr} }};\n"),
+                    )
+                } else if !has_raw_ptr {
+                    let rname = format!("RF_CONST_{gname}");
+                    let rty = gty.rust_type();
+                    let vis = if storage_class == "static" && options.export_c_symbols {
+                        "static"
+                    } else {
+                        "pub static"
+                    };
+                    (
+                        rname.clone(),
+                        GlobalKind::StaticConst,
+                        format!("{export_attr}{vis} {rname}: {rty} = unsafe {{ {init_expr} }};\n"),
+                    )
+                } else if options.export_c_symbols && storage_class != "static" {
+                    let rname = format!("RF_CONST_{gname}");
+                    let rty = gty.rust_type();
+                    (
+                        rname.clone(),
+                        GlobalKind::StaticMut,
+                        format!(
+                            "{export_attr}pub static mut {rname}: {rty} = unsafe {{ {init_expr} }};\n"
+                        ),
+                    )
+                } else {
+                    let rname = format!("RF_CONST_{gname}");
+                    let rty = gty.rust_type();
+                    (
+                        rname.clone(),
+                        GlobalKind::ConstItem,
+                        format!("pub const {rname}: {rty} = {init_expr};\n"),
+                    )
+                };
+
+                global_id_to_name.insert(id, gname.to_owned());
+                extern_globals.remove(gname);
+                if let Some((slot, prev_tentative)) = defined_global_slots.get_mut(gname) {
+                    if *prev_tentative || !is_tentative {
+                        *prev_tentative = is_tentative;
+                        global_defs_rust[*slot] = Some(decl_str);
+                        global_bindings.insert(
+                            gname.to_owned(),
+                            GlobalBinding {
+                                rust_name,
+                                c_name: gname.to_owned(),
+                                ty: gty,
+                                kind: kind_out,
+                            },
+                        );
+                    }
+                } else {
+                    let slot = global_defs_rust.len();
+                    global_defs_rust.push(Some(decl_str));
+                    defined_global_slots.insert(gname.to_owned(), (slot, is_tentative));
+                    global_bindings.insert(
+                        gname.to_owned(),
+                        GlobalBinding {
+                            rust_name,
+                            c_name: gname.to_owned(),
+                            ty: gty,
+                            kind: kind_out,
+                        },
+                    );
+                }
                 continue;
             }
             "FunctionDecl" => {}
@@ -2002,7 +2332,11 @@ pub fn translate(
 
         if body.is_none() {
             if node["variadic"].as_bool().unwrap_or(false) {
-                variadic_prototypes.insert(name.to_owned());
+                let parsed =
+                    parse_fn_signature_variadic(text(&node["type"], "qualType"), &typedefs)
+                        .map(|(p, r, _)| (p, r))
+                        .map_err(|e| e.to_string());
+                variadic_prototypes.insert(name.to_owned(), parsed);
                 continue;
             }
             let parse_proto = || -> Result<(Vec<CType>, CType)> {
@@ -2079,10 +2413,12 @@ pub fn translate(
         );
 
         let body = body.expect("checked above");
-        ensure!(
-            name != "main",
-            "main functions are not supported; select a library entry function"
-        );
+        if !options.allow_main {
+            ensure!(
+                name != "main",
+                "main functions are not supported; select a library entry function"
+            );
+        }
         ensure!(
             children(node)
                 .iter()
@@ -2102,7 +2438,9 @@ pub fn translate(
         let mut emitter = Emitter {
             variables: BTreeMap::new(),
             uninit_scalars: BTreeSet::new(),
-            const_globals: Cow::Borrowed(&const_globals),
+            global_id_to_name: Cow::Borrowed(&global_id_to_name),
+            global_bindings: Cow::Borrowed(&global_bindings),
+            referenced_globals: BTreeSet::new(),
             unsupported_globals: Cow::Borrowed(&unsupported_globals),
             variadic_prototypes: &variadic_prototypes,
             unsupported_prototypes: &unsupported_prototypes,
@@ -2125,6 +2463,7 @@ pub fn translate(
             current_clang_file: &cur_clang_str,
             current_source: &source,
             prototypes: &mut prototypes,
+            options,
         };
         let mut parameters = Vec::new();
         let mut signature = Vec::new();
@@ -2144,7 +2483,13 @@ pub fn translate(
             abi_args.push(generated);
         }
         emitter.next_variable = params.len();
-        let body_code = emitter.statement(body)?;
+        let body_code = if options.allow_general_cfg && needs_general_cfg(body) {
+            emitter.emit_general_cfg_body(body)?
+        } else {
+            emitter.statement(body)?
+        };
+        referenced_globals.extend(emitter.referenced_globals);
+        used_fn_deps.extend(emitter.dependencies.iter().cloned());
         let (pointer_contracts, safe_rust_wrapper) = analyze_pointer_params(
             name,
             body,
@@ -2153,7 +2498,9 @@ pub fn translate(
             &parameters,
             &return_ctype,
         );
-        let abi_export = if is_static {
+        let abi_export = if is_static
+            || (options.allow_main && name == "main" && options.export_c_symbols)
+        {
             String::new()
         } else {
             let ret_suffix = if matches!(return_ctype, CType::Void) {
@@ -2161,8 +2508,13 @@ pub fn translate(
             } else {
                 format!(" -> {}", return_ctype.rust_type())
             };
+            let attr = if options.export_c_symbols {
+                format!("#[unsafe(export_name = \"{name}\")]")
+            } else {
+                "#[unsafe(no_mangle)]".to_owned()
+            };
             format!(
-                "#[unsafe(no_mangle)]\npub extern \"C\" fn rf_abi_{name}({}){ret_suffix} {{\n    rf_{name}({})\n}}\n",
+                "{attr}\npub extern \"C\" fn rf_abi_{name}({}){ret_suffix} {{\n    rf_{name}({})\n}}\n",
                 abi_signature.join(", "),
                 abi_args.join(", "),
             )
@@ -2174,8 +2526,13 @@ pub fn translate(
                 signature.join(", ")
             )
         } else {
+            let fallthrough = if options.allow_main && name == "main" {
+                "return 0i32;"
+            } else {
+                "panic!(\"C function reached end without a return\");"
+            };
             format!(
-                "pub extern \"C\" fn rf_{name}({}) -> {} {{\nunsafe {{\n{body_code}\npanic!(\"C function reached end without a return\");\n}}\n}}\n{abi_export}{safe_export}",
+                "pub extern \"C\" fn rf_{name}({}) -> {} {{\nunsafe {{\n{body_code}\n{fallthrough}\n}}\n}}\n{abi_export}{safe_export}",
                 signature.join(", "),
                 return_ctype.rust_type()
             )
@@ -2198,8 +2555,26 @@ pub fn translate(
         });
     }
 
+    for (gname, (rust_name, gty)) in extern_globals {
+        if referenced_globals.contains(&gname) && !defined_global_slots.contains_key(&gname) {
+            let rty = gty.rust_type();
+            constants.push(format!(
+                "unsafe extern \"C\" {{\n    #[link_name = \"{gname}\"]\n    static mut {rust_name}: {rty};\n}}\n"
+            ));
+        }
+    }
+    for decl in global_defs_rust.into_iter().flatten() {
+        constants.push(decl);
+    }
+
     let defined_names: BTreeSet<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    prototypes.retain(|name, _| !defined_names.contains(name.as_str()));
+    if options.export_c_symbols {
+        prototypes.retain(|name, _| {
+            !defined_names.contains(name.as_str()) && used_fn_deps.contains(name.as_str())
+        });
+    } else {
+        prototypes.retain(|name, _| !defined_names.contains(name.as_str()));
+    }
 
     let mut used_struct_tags = BTreeSet::new();
     let mut used_union_tags = BTreeSet::new();
@@ -2318,9 +2693,11 @@ fn flatten_switch_node<'a>(
 struct Emitter<'a> {
     variables: BTreeMap<String, (String, CType)>,
     uninit_scalars: BTreeSet<String>,
-    const_globals: Cow<'a, BTreeMap<String, (String, CType, bool)>>,
+    global_id_to_name: Cow<'a, BTreeMap<String, String>>,
+    global_bindings: Cow<'a, BTreeMap<String, GlobalBinding>>,
+    referenced_globals: BTreeSet<String>,
     unsupported_globals: Cow<'a, BTreeMap<String, String>>,
-    variadic_prototypes: &'a BTreeSet<String>,
+    variadic_prototypes: &'a BTreeMap<String, std::result::Result<(Vec<CType>, CType), String>>,
     unsupported_prototypes: &'a BTreeMap<String, String>,
     dependencies: BTreeSet<String>,
     next_variable: usize,
@@ -2341,6 +2718,7 @@ struct Emitter<'a> {
     current_clang_file: &'a str,
     current_source: &'a str,
     prototypes: &'a mut BTreeMap<String, ExternalFunction>,
+    options: TranslateOptions,
 }
 
 impl Emitter<'_> {
@@ -2350,7 +2728,23 @@ impl Emitter<'_> {
         format!("{prefix}{id}")
     }
 
-    fn variable(&self, node: &Value) -> Result<(String, CType)> {
+    fn lookup_global(&self, ref_decl: &Value) -> Option<GlobalBinding> {
+        let id = text(ref_decl, "id");
+        if let Some(key) = self.global_id_to_name.get(id)
+            && let Some(binding) = self.global_bindings.get(key)
+        {
+            return Some(binding.clone());
+        }
+        let name = text(ref_decl, "name");
+        if !name.is_empty()
+            && let Some(binding) = self.global_bindings.get(name)
+        {
+            return Some(binding.clone());
+        }
+        None
+    }
+
+    fn variable(&mut self, node: &Value) -> Result<(String, CType)> {
         ensure!(
             kind(node) == "DeclRefExpr",
             "expected local variable reference"
@@ -2363,8 +2757,15 @@ impl Emitter<'_> {
             );
             return Ok(v.clone());
         }
-        if let Some((name, ty, _)) = self.const_globals.get(id) {
-            return Ok((name.clone(), ty.clone()));
+        if let Some(binding) = self.lookup_global(&node["referencedDecl"]) {
+            self.referenced_globals.insert(binding.c_name.clone());
+            let expr = match binding.kind {
+                GlobalKind::StaticMut => {
+                    format!("(*core::ptr::addr_of_mut!({}))", binding.rust_name)
+                }
+                GlobalKind::StaticConst | GlobalKind::ConstItem => binding.rust_name,
+            };
+            return Ok((expr, binding.ty));
         }
         if let Some(reason) = self.unsupported_globals.get(id) {
             bail!("{reason}");
@@ -2515,7 +2916,7 @@ impl Emitter<'_> {
 
     fn try_static_or_extern_local(&mut self, declaration: &Value) -> Result<Option<String>> {
         let storage_class = text(declaration, "storageClass");
-        if storage_class.is_empty() {
+        if matches!(storage_class, "" | "auto" | "register") {
             return Ok(None);
         }
         let decl_id = text(declaration, "id").to_owned();
@@ -2524,16 +2925,57 @@ impl Emitter<'_> {
             ensure!(init.is_none(), "extern local cannot have initializer");
             let gname = text(declaration, "name");
             identifier(gname)?;
-            if is_const_qualified(&declaration["type"])
+            if self.global_bindings.contains_key(gname) {
+                self.global_id_to_name
+                    .to_mut()
+                    .insert(decl_id, gname.to_owned());
+                return Ok(Some(String::new()));
+            }
+            if self.options.allow_mutable_globals {
+                if let Ok(gty) = CType::from_node_type(&declaration["type"], &self.typedefs)
+                    && !matches!(gty, CType::Void)
+                {
+                    let rust_name = self.fresh_var("RF_EXTERN_");
+                    let rty = gty.rust_type();
+                    self.global_id_to_name
+                        .to_mut()
+                        .insert(decl_id.clone(), decl_id.clone());
+                    self.global_bindings.to_mut().insert(
+                        decl_id.clone(),
+                        GlobalBinding {
+                            rust_name: rust_name.clone(),
+                            c_name: decl_id,
+                            ty: gty,
+                            kind: GlobalKind::StaticMut,
+                        },
+                    );
+                    return Ok(Some(format!(
+                        "unsafe extern \"C\" {{\n    #[link_name = \"{gname}\"]\n    static mut {rust_name}: {rty};\n}}"
+                    )));
+                }
+            } else if is_const_qualified(&declaration["type"])
                 && let Ok(gty) = CType::from_node_type(&declaration["type"], &self.typedefs)
                 && !matches!(gty, CType::Void | CType::Array(_, 0))
             {
                 let rust_name = self.fresh_var("RF_EXTERN_");
                 let rty = gty.rust_type();
-                let is_array = matches!(gty, CType::Array(..));
-                self.const_globals
+                let kind = if matches!(gty, CType::Array(..)) {
+                    GlobalKind::StaticConst
+                } else {
+                    GlobalKind::ConstItem
+                };
+                self.global_id_to_name
                     .to_mut()
-                    .insert(decl_id, (rust_name.clone(), gty, is_array));
+                    .insert(decl_id.clone(), decl_id.clone());
+                self.global_bindings.to_mut().insert(
+                    decl_id.clone(),
+                    GlobalBinding {
+                        rust_name: rust_name.clone(),
+                        c_name: decl_id,
+                        ty: gty,
+                        kind,
+                    },
+                );
                 return Ok(Some(format!(
                     "unsafe extern \"C\" {{\n    #[link_name = \"{gname}\"]\n    static {rust_name}: {rty};\n}}"
                 )));
@@ -2543,8 +2985,9 @@ impl Emitter<'_> {
                 .insert(decl_id, format!("external global {gname} is unsupported"));
             return Ok(Some(String::new()));
         }
+        let is_const = is_const_qualified(&declaration["type"]);
         ensure!(
-            storage_class == "static" && is_const_qualified(&declaration["type"]),
+            storage_class == "static" && (is_const || self.options.allow_mutable_static_locals),
             "static/extern locals unsupported"
         );
         let var_ty = CType::from_node_type(&declaration["type"], &self.typedefs)?;
@@ -2561,17 +3004,35 @@ impl Emitter<'_> {
         } else {
             var_ty.zero_expr(&self.structs)?
         };
-        let is_static = matches!(var_ty, CType::Array(..))
-            && !var_ty.contains_raw_ptr(&self.structs, &self.unions);
-        let kw = if is_static { "static" } else { "const" };
-        let val_block = if is_static {
-            format!("unsafe {{ {val} }}")
+        let (kind, kw, val_block) = if !is_const {
+            (
+                GlobalKind::StaticMut,
+                "static mut",
+                format!("unsafe {{ {val} }}"),
+            )
+        } else if matches!(var_ty, CType::Array(..))
+            && !var_ty.contains_raw_ptr(&self.structs, &self.unions)
+        {
+            (
+                GlobalKind::StaticConst,
+                "static",
+                format!("unsafe {{ {val} }}"),
+            )
         } else {
-            val
+            (GlobalKind::ConstItem, "const", val)
         };
-        self.const_globals
+        self.global_id_to_name
             .to_mut()
-            .insert(decl_id, (name.clone(), var_ty, is_static));
+            .insert(decl_id.clone(), decl_id.clone());
+        self.global_bindings.to_mut().insert(
+            decl_id.clone(),
+            GlobalBinding {
+                rust_name: name.clone(),
+                c_name: decl_id,
+                ty: var_ty,
+                kind,
+            },
+        );
         Ok(Some(format!("{kw} {name}: {rust_ty} = {val_block};")))
     }
 
@@ -2616,9 +3077,13 @@ impl Emitter<'_> {
         let inner = children(node);
         match kind(node) {
             "DeclRefExpr" => self.variable(node),
-            "ParenExpr" => {
+            "ParenExpr" | "ExprWithCleanups" => {
                 ensure!(inner.len() == 1, "invalid parenthesized lvalue");
                 self.lvalue(&inner[0])
+            }
+            "MaterializeTemporaryExpr" => {
+                ensure!(inner.len() == 1, "invalid temporary lvalue");
+                self.typed_expression(&inner[0])
             }
             "UnaryOperator" if text(node, "opcode") == "*" => {
                 ensure!(inner.len() == 1, "invalid dereference");
@@ -2628,6 +3093,7 @@ impl Emitter<'_> {
                         ensure!(!matches!(*inner, CType::Void), "cannot dereference void *");
                         Ok((format!("(*rf_ptr({ptr}))"), *inner))
                     }
+                    CType::FnPtr { .. } => Ok((ptr, ty)),
                     _ => bail!("dereference requires a pointer"),
                 }
             }
@@ -2679,7 +3145,13 @@ impl Emitter<'_> {
         }
     }
 
-    fn int_binary_op(op: &str, kind: IntKind, left: &str, right: &str) -> Result<String> {
+    fn int_binary_op(
+        op: &str,
+        kind: IntKind,
+        left: &str,
+        right: &str,
+        rhs_signed: bool,
+    ) -> Result<String> {
         Ok(match op {
             "+" | "-" | "*" => {
                 if kind.is_signed() {
@@ -2712,9 +3184,15 @@ impl Emitter<'_> {
                 } else {
                     "checked_shr"
                 };
-                format!(
-                    "({{ let rf_l = {left}; let rf_r = {right}; let rf_s = rf_r as i128; if rf_s < 0 || rf_s > (u32::MAX as i128) {{ panic!(\"undefined C shift\"); }} rf_l.{method}(rf_s as u32).expect(\"undefined C shift\") }})"
-                )
+                if rhs_signed {
+                    format!(
+                        "({{ let rf_l = {left}; let rf_r = {right}; let rf_s = rf_r as i128; if rf_s < 0 || rf_s > (u32::MAX as i128) {{ panic!(\"undefined C shift\"); }} rf_l.{method}(rf_s as u32).expect(\"undefined C shift\") }})"
+                    )
+                } else {
+                    format!(
+                        "({{ let rf_l = {left}; let rf_r = {right}; let rf_s = rf_r as u128; if rf_s > (u32::MAX as u128) {{ panic!(\"undefined C shift\"); }} rf_l.{method}(rf_s as u32).expect(\"undefined C shift\") }})"
+                    )
+                }
             }
             "&" | "|" | "^" => format!("(({left}) {op} ({right}))"),
             _ => bail!("unsupported integer binary operator {op}"),
@@ -3009,7 +3487,7 @@ impl Emitter<'_> {
                         let name = text(ref_decl, "name");
                         identifier(name)?;
                         ensure!(
-                            !self.variadic_prototypes.contains(name),
+                            !self.variadic_prototypes.contains_key(name),
                             "variadic functions are unsupported"
                         );
                         if let Some(reason) = self.unsupported_prototypes.get(name) {
@@ -3049,6 +3527,10 @@ impl Emitter<'_> {
                 ensure!(inner.len() == 1, "invalid parentheses");
                 let (expr, ty) = self.typed_expression(&inner[0])?;
                 Ok((format!("({expr})"), ty))
+            }
+            "ExprWithCleanups" | "MaterializeTemporaryExpr" => {
+                ensure!(inner.len() == 1, "invalid cleanup/temporary expression");
+                self.typed_expression(&inner[0])
             }
             "ImplicitValueInitExpr" => {
                 let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
@@ -3172,11 +3654,9 @@ impl Emitter<'_> {
                             ));
                         }
                         if kind(&inner[0]) == "DeclRefExpr"
-                            && let Some((cname, cty, is_static)) = self
-                                .const_globals
-                                .get(text(&inner[0]["referencedDecl"], "id"))
+                            && let Some(binding) = self.lookup_global(&inner[0]["referencedDecl"])
                         {
-                            let CType::Array(elem_ty, _) = cty else {
+                            let CType::Array(elem_ty, _) = &binding.ty else {
                                 bail!("ArrayToPointerDecay requires array operand");
                             };
                             ensure!(
@@ -3186,10 +3666,20 @@ impl Emitter<'_> {
                                 }),
                                 "ArrayToPointerDecay type mismatch"
                             );
-                            let ptr_expr = if *is_static {
-                                format!("({cname}.as_ptr() as *mut {})", elem_ty.rust_type())
-                            } else {
-                                format!("((&{cname}).as_ptr() as *mut {})", elem_ty.rust_type())
+                            self.referenced_globals.insert(binding.c_name);
+                            let elem_rty = elem_ty.rust_type();
+                            let ptr_expr = match binding.kind {
+                                GlobalKind::StaticMut => format!(
+                                    "(core::ptr::addr_of_mut!({}) as *mut {elem_rty})",
+                                    binding.rust_name
+                                ),
+                                GlobalKind::StaticConst => {
+                                    format!("({}.as_ptr() as *mut {elem_rty})", binding.rust_name)
+                                }
+                                GlobalKind::ConstItem => format!(
+                                    "((&{}).as_ptr() as *mut {elem_rty})",
+                                    binding.rust_name
+                                ),
                             };
                             return Ok((ptr_expr, target_ty));
                         }
@@ -3479,11 +3969,21 @@ impl Emitter<'_> {
                                 break;
                             }
                         }
-                        let is_const_global = kind(root_lval) == "DeclRefExpr"
-                            && self
-                                .const_globals
-                                .contains_key(text(&root_lval["referencedDecl"], "id"));
-                        let ptr_expr = if is_const_global {
+                        let root_binding = (kind(root_lval) == "DeclRefExpr")
+                            .then(|| self.lookup_global(&root_lval["referencedDecl"]))
+                            .flatten();
+                        let ptr_expr = if kind(peeled) == "DeclRefExpr"
+                            && let Some(binding) = self.lookup_global(&peeled["referencedDecl"])
+                            && binding.kind == GlobalKind::StaticMut
+                        {
+                            self.referenced_globals.insert(binding.c_name);
+                            format!("core::ptr::addr_of_mut!({})", binding.rust_name)
+                        } else if let Some(binding) = root_binding
+                            && matches!(
+                                binding.kind,
+                                GlobalKind::StaticConst | GlobalKind::ConstItem
+                            )
+                        {
                             format!("(&({lv}) as *const {rty} as *mut {rty})")
                         } else {
                             format!("(&mut ({lv}) as *mut {rty})")
@@ -3659,9 +4159,10 @@ impl Emitter<'_> {
                         let (left, lty) = self.typed_expression(&inner[0])?;
                         let (right, rty) = self.typed_expression(&inner[1])?;
                         match (op, &lty, &rty) {
-                            (_, CType::Int(a), CType::Int(b)) if a == b => {
-                                Ok((Self::int_binary_op(op, *a, &left, &right)?, lty))
-                            }
+                            (_, CType::Int(a), CType::Int(b)) if a == b => Ok((
+                                Self::int_binary_op(op, *a, &left, &right, b.is_signed())?,
+                                lty,
+                            )),
                             (_, CType::Float(a), CType::Float(b)) if a == b => {
                                 Ok((format!("(({left}) {op} ({right}))"), lty))
                             }
@@ -3711,7 +4212,10 @@ impl Emitter<'_> {
                             (CType::Int(a), CType::Int(b))
                                 if a == b || matches!(op, "<<" | ">>") =>
                             {
-                                Ok((Self::int_binary_op(op, a, &left, &right)?, lty))
+                                Ok((
+                                    Self::int_binary_op(op, a, &left, &right, b.is_signed())?,
+                                    lty,
+                                ))
                             }
                             (CType::Float(a), CType::Float(b))
                                 if a == b && matches!(op, "*" | "/") =>
@@ -3736,12 +4240,18 @@ impl Emitter<'_> {
                 let ptr_var = self.fresh_var("rf_lhs");
                 let mut updated = match (&lty, &rty, base_op) {
                     (CType::Int(lk), CType::Int(rk), _) => {
-                        let rhs_cast = if lk == rk || matches!(base_op, "<<" | ">>") {
-                            rhs_var.clone()
+                        let (rhs_cast, rhs_signed) = if lk == rk || matches!(base_op, "<<" | ">>") {
+                            (rhs_var.clone(), rk.is_signed())
                         } else {
-                            format!("({rhs_var} as {})", lk.rust_type())
+                            (format!("({rhs_var} as {})", lk.rust_type()), lk.is_signed())
                         };
-                        Self::int_binary_op(base_op, *lk, &format!("(*{ptr_var})"), &rhs_cast)?
+                        Self::int_binary_op(
+                            base_op,
+                            *lk,
+                            &format!("(*{ptr_var})"),
+                            &rhs_cast,
+                            rhs_signed,
+                        )?
                     }
                     (CType::Float(lk), CType::Float(_), "+" | "-" | "*" | "/")
                     | (CType::Float(lk), CType::Int(_), "+" | "-" | "*" | "/") => {
@@ -3840,10 +4350,29 @@ impl Emitter<'_> {
                             text(&ref_decl["type"], "qualType"),
                         );
                     }
-                    ensure!(
-                        !self.variadic_prototypes.contains(name),
-                        "variadic functions are unsupported"
-                    );
+                    if let Some(variadic_entry) = self.variadic_prototypes.get(name).cloned() {
+                        ensure!(
+                            self.options.allow_variadic_calls,
+                            "variadic functions are unsupported"
+                        );
+                        let (fixed_params, ret_type) = match variadic_entry {
+                            Ok(sig) => sig,
+                            Err(reason) => bail!("{reason}"),
+                        };
+                        ensure!(
+                            inner.len() > fixed_params.len(),
+                            "call to {name} argument count mismatch"
+                        );
+                        let fixed_refs: Vec<&Value> =
+                            inner[1..1 + fixed_params.len()].iter().collect();
+                        return self.emit_variadic_call(
+                            name,
+                            &fixed_params,
+                            &fixed_refs,
+                            &inner[1 + fixed_params.len()..],
+                            ret_type,
+                        );
+                    }
                     if let Some(reason) = self.unsupported_prototypes.get(name) {
                         bail!("{reason}");
                     }
@@ -3950,6 +4479,41 @@ impl Emitter<'_> {
         ))
     }
 
+    fn emit_variadic_call(
+        &mut self,
+        c_name: &str,
+        fixed_params: &[CType],
+        fixed_arg_nodes: &[&Value],
+        extra_arg_nodes: &[Value],
+        ret_type: CType,
+    ) -> Result<(String, CType)> {
+        ensure!(
+            fixed_arg_nodes.len() == fixed_params.len(),
+            "call to {c_name} argument count mismatch"
+        );
+        let mut arguments = Vec::with_capacity(fixed_params.len() + extra_arg_nodes.len());
+        for (arg_node, expected_ty) in fixed_arg_nodes.iter().zip(fixed_params) {
+            let (arg_expr, arg_ty) = self.typed_expression(arg_node)?;
+            ensure!(
+                arg_ty.same_shape(expected_ty),
+                "call to {c_name} argument type mismatch"
+            );
+            arguments.push(arg_expr);
+        }
+        for arg_node in extra_arg_nodes {
+            let (arg_expr, arg_ty) = self.typed_expression(arg_node)?;
+            arguments.push(promote_variadic_arg(arg_expr, &arg_ty)?);
+        }
+        self.dependencies.insert(c_name.into());
+        self.prototypes
+            .entry(c_name.to_owned())
+            .or_insert_with(|| make_external_variadic_function(c_name, fixed_params, &ret_type));
+        Ok((
+            format!("unsafe {{ rf_var_{c_name}({}) }}", arguments.join(", ")),
+            ret_type,
+        ))
+    }
+
     fn try_emit_builtin(
         &mut self,
         name: &str,
@@ -4029,6 +4593,39 @@ impl Emitter<'_> {
                     ),
                     rt,
                 ));
+            }
+            "__builtin___snprintf_chk"
+            | "__builtin___sprintf_chk"
+            | "__builtin___fprintf_chk"
+            | "__builtin___printf_chk"
+                if self.options.allow_variadic_calls =>
+            {
+                let (fixed_params, ret_type, _) =
+                    parse_fn_signature_variadic(qual_type, &self.typedefs)?;
+                let (target_name, keep_indices): (&str, &[usize]) = match name {
+                    "__builtin___snprintf_chk" => ("snprintf", &[0, 1, 4]),
+                    "__builtin___sprintf_chk" => ("sprintf", &[0, 3]),
+                    "__builtin___fprintf_chk" => ("fprintf", &[0, 2]),
+                    _ => ("printf", &[1]),
+                };
+                ensure!(
+                    fixed_params.len() > *keep_indices.last().unwrap()
+                        && arg_nodes.len() >= fixed_params.len(),
+                    "builtin {name} argument count mismatch"
+                );
+                let forwarded_params: Vec<CType> = keep_indices
+                    .iter()
+                    .map(|&idx| fixed_params[idx].clone())
+                    .collect();
+                let fixed_refs: Vec<&Value> =
+                    keep_indices.iter().map(|&idx| &arg_nodes[idx]).collect();
+                return self.emit_variadic_call(
+                    target_name,
+                    &forwarded_params,
+                    &fixed_refs,
+                    &arg_nodes[fixed_params.len()..],
+                    ret_type,
+                );
             }
             _ => {}
         }
@@ -4120,6 +4717,35 @@ impl Emitter<'_> {
                 Ok((
                     format!(
                         "{{ let {d_var} = {}; let {s_var} = {}; let {n_var} = ({}) as usize; let mut {i_var}: usize = 0; while {i_var} < {n_var} {{ let {ch_var} = *{s_var}.add({i_var}); *{d_var}.add({i_var}) = {ch_var}; {i_var} += 1; if {ch_var} == 0 {{ while {i_var} < {n_var} {{ *{d_var}.add({i_var}) = 0; {i_var} += 1; }} break; }} }} {d_var} }}",
+                        args[0], args[1], args[2]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin___strcat_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let s_var = self.fresh_var("rf_src");
+                let n_var = self.fresh_var("rf_len");
+                let i_var = self.fresh_var("rf_idx");
+                let ch_var = self.fresh_var("rf_ch");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {s_var} = {}; let mut {n_var}: isize = 0; while *{d_var}.offset({n_var}) != 0 {{ {n_var} += 1; }} let mut {i_var}: isize = 0; loop {{ let {ch_var} = *{s_var}.offset({i_var}); *{d_var}.offset({n_var} + {i_var}) = {ch_var}; if {ch_var} == 0 {{ break; }} {i_var} += 1; }} {d_var} }}",
+                        args[0], args[1]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin___strncat_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let s_var = self.fresh_var("rf_src");
+                let max_var = self.fresh_var("rf_max");
+                let n_var = self.fresh_var("rf_len");
+                let i_var = self.fresh_var("rf_idx");
+                let ch_var = self.fresh_var("rf_ch");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {s_var} = {}; let {max_var} = ({}) as usize; let mut {n_var}: usize = 0; while *{d_var}.add({n_var}) != 0 {{ {n_var} += 1; }} let mut {i_var}: usize = 0; while {i_var} < {max_var} {{ let {ch_var} = *{s_var}.add({i_var}); *{d_var}.add({n_var} + {i_var}) = {ch_var}; if {ch_var} == 0 {{ break; }} {i_var} += 1; }} *{d_var}.add({n_var} + {i_var}) = 0; {d_var} }}",
                         args[0], args[1], args[2]
                     ),
                     ret_type,
@@ -4291,7 +4917,7 @@ impl Emitter<'_> {
                         hoisted.push(format!("let mut {name}: {rust_ty} = {zero};"));
                         if let Some(init_node) = local_initializer(declaration)? {
                             init_pairs.push((decl_id, name, var_ty, init_node.clone()));
-                        } else if is_scalar_type(&var_ty) {
+                        } else if !self.options.allow_uninit_locals && is_scalar_type(&var_ty) {
                             self.uninit_scalars.insert(decl_id);
                         }
                     }
@@ -4608,7 +5234,7 @@ impl Emitter<'_> {
                         val
                     } else {
                         let z = var_ty.zero_expr(&self.structs)?;
-                        if is_scalar_type(&var_ty) {
+                        if !self.options.allow_uninit_locals && is_scalar_type(&var_ty) {
                             self.uninit_scalars.insert(decl_id.clone());
                         }
                         z
@@ -4621,5 +5247,662 @@ impl Emitter<'_> {
             "NullStmt" => Ok(";".into()),
             _ => Ok(format!("{};", self.typed_expression(node)?.0)),
         }
+    }
+
+    fn emit_general_cfg_body(&mut self, body: &Value) -> Result<String> {
+        let mut builder = CfgBuilder {
+            emitter: self,
+            blocks: Vec::new(),
+            label_blocks: BTreeMap::new(),
+            static_or_extern_ids: BTreeSet::new(),
+            hoisted_items: Vec::new(),
+            break_targets: Vec::new(),
+            continue_targets: Vec::new(),
+            switch_stack: Vec::new(),
+        };
+        builder.hoist_local_decls(body)?;
+        builder.preallocate_labels(body)?;
+        let entry_bb = builder.new_block();
+        let exit_bb = builder.new_block();
+        builder.blocks[exit_bb].term = CfgTerm::Exit;
+        let end_bb = builder.lower_stmt(body, entry_bb)?;
+        builder.set_jump(end_bb, exit_bb);
+        builder.render(entry_bb, exit_bb)
+    }
+}
+
+struct CfgProbeState {
+    pos: usize,
+    compound_stack: Vec<usize>,
+    labels: BTreeMap<String, (usize, Option<usize>)>,
+    complex: bool,
+}
+
+fn check_switch_complexity(node: &Value, in_control: bool) -> bool {
+    let k = kind(node);
+    if k == "LabelStmt" {
+        return true;
+    }
+    if matches!(k, "CaseStmt" | "DefaultStmt") && in_control {
+        return true;
+    }
+    if matches!(k, "SwitchStmt" | "StmtExpr") {
+        return false;
+    }
+    let next_in_control = in_control
+        || matches!(
+            k,
+            "IfStmt" | "WhileStmt" | "DoStmt" | "ForStmt" | "LabelStmt"
+        );
+    children(node)
+        .iter()
+        .any(|c| check_switch_complexity(c, next_in_control))
+}
+
+fn cfg_probe_pass1(node: &Value, direct_compound: Option<usize>, state: &mut CfgProbeState) {
+    if state.complex {
+        return;
+    }
+    let k = kind(node);
+    if k == "StmtExpr" {
+        return;
+    }
+    let my_pos = state.pos;
+    state.pos += 1;
+    match k {
+        "CompoundStmt" => {
+            state.compound_stack.push(my_pos);
+            for c in children(node) {
+                cfg_probe_pass1(c, Some(my_pos), state);
+            }
+            state.compound_stack.pop();
+        }
+        "LabelStmt" => {
+            let decl_id = text(node, "declId").to_owned();
+            state.labels.insert(decl_id, (my_pos, direct_compound));
+            if direct_compound.is_none() {
+                state.complex = true;
+                return;
+            }
+            for c in children(node) {
+                cfg_probe_pass1(c, direct_compound, state);
+            }
+        }
+        "SwitchStmt" => {
+            if children(node)
+                .get(1)
+                .is_some_and(|b| check_switch_complexity(b, false))
+            {
+                state.complex = true;
+                return;
+            }
+            for c in children(node) {
+                cfg_probe_pass1(c, None, state);
+            }
+        }
+        _ => {
+            for c in children(node) {
+                cfg_probe_pass1(c, None, state);
+            }
+        }
+    }
+}
+
+fn cfg_probe_pass2(node: &Value, state: &mut CfgProbeState) -> bool {
+    let k = kind(node);
+    if k == "StmtExpr" {
+        return false;
+    }
+    let my_pos = state.pos;
+    state.pos += 1;
+    match k {
+        "CompoundStmt" => {
+            state.compound_stack.push(my_pos);
+            let res = children(node).iter().any(|c| cfg_probe_pass2(c, state));
+            state.compound_stack.pop();
+            res
+        }
+        "GotoStmt" => {
+            let target = text(node, "targetLabelDeclId");
+            let Some(&(lbl_pos, Some(lbl_compound))) = state.labels.get(target) else {
+                return true;
+            };
+            !(lbl_pos > my_pos && state.compound_stack.contains(&lbl_compound))
+        }
+        _ => children(node).iter().any(|c| cfg_probe_pass2(c, state)),
+    }
+}
+
+fn needs_general_cfg(body: &Value) -> bool {
+    let mut state = CfgProbeState {
+        pos: 0,
+        compound_stack: Vec::new(),
+        labels: BTreeMap::new(),
+        complex: false,
+    };
+    cfg_probe_pass1(body, None, &mut state);
+    if state.complex {
+        return true;
+    }
+    state.pos = 0;
+    state.compound_stack.clear();
+    cfg_probe_pass2(body, &mut state)
+}
+
+enum CfgTerm {
+    Unreachable,
+    Jump(usize),
+    Branch {
+        cond: String,
+        then_bb: usize,
+        else_bb: usize,
+    },
+    Switch {
+        sw_var: String,
+        cases: Vec<(String, usize)>,
+        default_bb: usize,
+    },
+    Return,
+    Exit,
+}
+
+struct CfgBlock {
+    stmts: Vec<String>,
+    term: CfgTerm,
+}
+
+struct CfgSwitch {
+    sw_ty: CType,
+    cases: Vec<(String, usize)>,
+    default_bb: Option<usize>,
+}
+
+struct CfgBuilder<'a, 'b> {
+    emitter: &'a mut Emitter<'b>,
+    blocks: Vec<CfgBlock>,
+    label_blocks: BTreeMap<String, usize>,
+    static_or_extern_ids: BTreeSet<String>,
+    hoisted_items: Vec<String>,
+    break_targets: Vec<usize>,
+    continue_targets: Vec<usize>,
+    switch_stack: Vec<CfgSwitch>,
+}
+
+impl<'a, 'b> CfgBuilder<'a, 'b> {
+    fn new_block(&mut self) -> usize {
+        let id = self.blocks.len();
+        self.blocks.push(CfgBlock {
+            stmts: Vec::new(),
+            term: CfgTerm::Unreachable,
+        });
+        id
+    }
+
+    fn set_jump(&mut self, bb: usize, target: usize) {
+        if matches!(self.blocks[bb].term, CfgTerm::Unreachable) {
+            self.blocks[bb].term = CfgTerm::Jump(target);
+        }
+    }
+
+    fn hoist_local_decls(&mut self, node: &Value) -> Result<()> {
+        let k = kind(node);
+        if k == "StmtExpr" {
+            return Ok(());
+        }
+        if k == "DeclStmt" {
+            for declaration in children(node) {
+                if self.emitter.handle_non_var_local_decl(declaration)? {
+                    continue;
+                }
+                ensure!(
+                    kind(declaration) == "VarDecl",
+                    "unsupported local declaration"
+                );
+                let decl_id = text(declaration, "id").to_owned();
+                if let Some(static_or_extern_stmt) =
+                    self.emitter.try_static_or_extern_local(declaration)?
+                {
+                    if !static_or_extern_stmt.is_empty() {
+                        self.hoisted_items.push(static_or_extern_stmt);
+                    }
+                    self.static_or_extern_ids.insert(decl_id);
+                    continue;
+                }
+                let var_ty = CType::from_node_type(&declaration["type"], &self.emitter.typedefs)?;
+                ensure!(
+                    !matches!(var_ty, CType::Void),
+                    "void local variable unsupported"
+                );
+                let name = self.emitter.fresh_var("v");
+                let rust_ty = var_ty.rust_type();
+                let zero = var_ty.zero_expr(&self.emitter.structs)?;
+                self.emitter
+                    .variables
+                    .insert(decl_id, (name.clone(), var_ty));
+                self.hoisted_items
+                    .push(format!("let mut {name}: {rust_ty} = {zero};"));
+            }
+            return Ok(());
+        }
+        if matches!(
+            k,
+            "CompoundStmt"
+                | "IfStmt"
+                | "WhileStmt"
+                | "DoStmt"
+                | "ForStmt"
+                | "SwitchStmt"
+                | "CaseStmt"
+                | "DefaultStmt"
+                | "LabelStmt"
+        ) {
+            for child in children(node) {
+                self.hoist_local_decls(child)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preallocate_labels(&mut self, node: &Value) -> Result<()> {
+        let k = kind(node);
+        if k == "StmtExpr" {
+            return Ok(());
+        }
+        if k == "LabelStmt" {
+            let decl_id = text(node, "declId");
+            ensure!(!decl_id.is_empty(), "missing label declId");
+            let bb = self.new_block();
+            self.label_blocks.insert(decl_id.to_owned(), bb);
+        }
+        if matches!(
+            k,
+            "CompoundStmt"
+                | "IfStmt"
+                | "WhileStmt"
+                | "DoStmt"
+                | "ForStmt"
+                | "SwitchStmt"
+                | "CaseStmt"
+                | "DefaultStmt"
+                | "LabelStmt"
+        ) {
+            for child in children(node) {
+                self.preallocate_labels(child)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_stmt(&mut self, node: &Value, cur_bb: usize) -> Result<usize> {
+        let inner = children(node);
+        match kind(node) {
+            "CompoundStmt" => {
+                let mut bb = cur_bb;
+                for item in inner {
+                    bb = self.lower_stmt(item, bb)?;
+                }
+                Ok(bb)
+            }
+            "LabelStmt" => {
+                let decl_id = text(node, "declId");
+                let lbl_bb = *self
+                    .label_blocks
+                    .get(decl_id)
+                    .with_context(|| format!("unknown label {decl_id}"))?;
+                self.set_jump(cur_bb, lbl_bb);
+                if let Some(sub) = inner.first() {
+                    self.lower_stmt(sub, lbl_bb)
+                } else {
+                    Ok(lbl_bb)
+                }
+            }
+            "GotoStmt" => {
+                let target_id = text(node, "targetLabelDeclId");
+                let target_bb = *self
+                    .label_blocks
+                    .get(target_id)
+                    .with_context(|| format!("unknown goto target {target_id}"))?;
+                self.set_jump(cur_bb, target_bb);
+                Ok(self.new_block())
+            }
+            "ReturnStmt" => {
+                if matches!(self.emitter.return_type, CType::Void) {
+                    ensure!(inner.is_empty(), "void return cannot return a value");
+                    self.blocks[cur_bb].stmts.push("return;".into());
+                } else {
+                    ensure!(inner.len() == 1, "non-void return requires a value");
+                    let (expr, ty) = self.emitter.typed_expression(&inner[0])?;
+                    ensure!(
+                        ty.same_shape(&self.emitter.return_type),
+                        "return type mismatch with function signature"
+                    );
+                    self.blocks[cur_bb].stmts.push(format!("return {expr};"));
+                }
+                self.blocks[cur_bb].term = CfgTerm::Return;
+                Ok(self.new_block())
+            }
+            "IfStmt" => {
+                ensure!(
+                    (inner.len() == 2 || inner.len() == 3)
+                        && !node["hasInit"].as_bool().unwrap_or(false),
+                    "unsupported if structure"
+                );
+                let cond = self.emitter.condition(&inner[0])?;
+                let then_bb = self.new_block();
+                let else_bb = (inner.len() == 3).then(|| self.new_block());
+                let join_bb = self.new_block();
+                self.blocks[cur_bb].term = CfgTerm::Branch {
+                    cond,
+                    then_bb,
+                    else_bb: else_bb.unwrap_or(join_bb),
+                };
+                let then_end = self.lower_stmt(&inner[1], then_bb)?;
+                self.set_jump(then_end, join_bb);
+                if let Some(ebb) = else_bb {
+                    let else_end = self.lower_stmt(&inner[2], ebb)?;
+                    self.set_jump(else_end, join_bb);
+                }
+                Ok(join_bb)
+            }
+            "WhileStmt" => {
+                ensure!(
+                    inner.len() == 2 && !node["hasVar"].as_bool().unwrap_or(false),
+                    "unsupported while structure"
+                );
+                let header_bb = self.new_block();
+                let body_bb = self.new_block();
+                let after_bb = self.new_block();
+                self.set_jump(cur_bb, header_bb);
+                let cond = self.emitter.condition(&inner[0])?;
+                self.blocks[header_bb].term = CfgTerm::Branch {
+                    cond,
+                    then_bb: body_bb,
+                    else_bb: after_bb,
+                };
+                self.continue_targets.push(header_bb);
+                self.break_targets.push(after_bb);
+                let body_res = self.lower_stmt(&inner[1], body_bb);
+                self.break_targets.pop();
+                self.continue_targets.pop();
+                let body_end = body_res?;
+                self.set_jump(body_end, header_bb);
+                Ok(after_bb)
+            }
+            "DoStmt" => {
+                ensure!(inner.len() == 2, "unsupported do-while structure");
+                let body_bb = self.new_block();
+                let cond_bb = self.new_block();
+                let after_bb = self.new_block();
+                self.set_jump(cur_bb, body_bb);
+                self.continue_targets.push(cond_bb);
+                self.break_targets.push(after_bb);
+                let body_res = self.lower_stmt(&inner[0], body_bb);
+                self.break_targets.pop();
+                self.continue_targets.pop();
+                let body_end = body_res?;
+                self.set_jump(body_end, cond_bb);
+                let cond = self.emitter.condition(&inner[1])?;
+                self.blocks[cond_bb].term = CfgTerm::Branch {
+                    cond,
+                    then_bb: body_bb,
+                    else_bb: after_bb,
+                };
+                Ok(after_bb)
+            }
+            "ForStmt" => {
+                ensure!(inner.len() == 5, "unsupported for structure");
+                ensure!(
+                    inner[1].get("kind").is_none(),
+                    "for condition variable declaration is unsupported"
+                );
+                let mut bb = cur_bb;
+                if inner[0].get("kind").is_some() {
+                    if kind(&inner[0]) == "DeclStmt" {
+                        bb = self.lower_stmt(&inner[0], bb)?;
+                    } else {
+                        let expr = self.emitter.typed_expression(&inner[0])?.0;
+                        self.blocks[bb].stmts.push(format!("{expr};"));
+                    }
+                }
+                let header_bb = self.new_block();
+                let body_bb = self.new_block();
+                let inc_bb = self.new_block();
+                let after_bb = self.new_block();
+                self.set_jump(bb, header_bb);
+                if inner[2].get("kind").is_some() {
+                    let cond = self.emitter.condition(&inner[2])?;
+                    self.blocks[header_bb].term = CfgTerm::Branch {
+                        cond,
+                        then_bb: body_bb,
+                        else_bb: after_bb,
+                    };
+                } else {
+                    self.set_jump(header_bb, body_bb);
+                }
+                self.continue_targets.push(inc_bb);
+                self.break_targets.push(after_bb);
+                let body_res = self.lower_stmt(&inner[4], body_bb);
+                self.break_targets.pop();
+                self.continue_targets.pop();
+                let body_end = body_res?;
+                self.set_jump(body_end, inc_bb);
+                if inner[3].get("kind").is_some() {
+                    let inc_expr = self.emitter.typed_expression(&inner[3])?.0;
+                    self.blocks[inc_bb].stmts.push(format!("{inc_expr};"));
+                }
+                self.set_jump(inc_bb, header_bb);
+                Ok(after_bb)
+            }
+            "SwitchStmt" => {
+                ensure!(
+                    inner.len() == 2 && !node["hasInit"].as_bool().unwrap_or(false),
+                    "unsupported switch structure"
+                );
+                let (sw_expr, sw_ty) = self.emitter.typed_expression(&inner[0])?;
+                ensure!(
+                    matches!(sw_ty, CType::Int(_)),
+                    "switch condition must be integer type"
+                );
+                let sw_var = self.emitter.fresh_var("rf_sw_val");
+                self.blocks[cur_bb]
+                    .stmts
+                    .push(format!("let {sw_var} = {sw_expr};"));
+                let pre_bb = self.new_block();
+                let break_bb = self.new_block();
+                self.switch_stack.push(CfgSwitch {
+                    sw_ty,
+                    cases: Vec::new(),
+                    default_bb: None,
+                });
+                self.break_targets.push(break_bb);
+                let body_res = self.lower_stmt(&inner[1], pre_bb);
+                self.break_targets.pop();
+                let sw_info = self.switch_stack.pop().unwrap();
+                let body_end = body_res?;
+                self.set_jump(body_end, break_bb);
+                let default_bb = sw_info.default_bb.unwrap_or(break_bb);
+                self.blocks[cur_bb].term = CfgTerm::Switch {
+                    sw_var,
+                    cases: sw_info.cases,
+                    default_bb,
+                };
+                Ok(break_bb)
+            }
+            "CaseStmt" => {
+                ensure!(inner.len() == 2, "unsupported case statement");
+                let sw_ty = self
+                    .switch_stack
+                    .last()
+                    .context("case label outside switch statement")?
+                    .sw_ty
+                    .clone();
+                let (c_expr, c_ty) = self.emitter.typed_expression(&inner[0])?;
+                let rhs = if c_ty.same_shape(&sw_ty) {
+                    c_expr
+                } else {
+                    format!("(({c_expr}) as {})", sw_ty.rust_type())
+                };
+                let case_bb = self.new_block();
+                self.set_jump(cur_bb, case_bb);
+                self.switch_stack
+                    .last_mut()
+                    .unwrap()
+                    .cases
+                    .push((rhs, case_bb));
+                self.lower_stmt(&inner[1], case_bb)
+            }
+            "DefaultStmt" => {
+                ensure!(inner.len() == 1, "invalid default statement");
+                ensure!(
+                    !self.switch_stack.is_empty(),
+                    "default label outside switch statement"
+                );
+                let def_bb = self.new_block();
+                self.set_jump(cur_bb, def_bb);
+                self.switch_stack.last_mut().unwrap().default_bb = Some(def_bb);
+                self.lower_stmt(&inner[0], def_bb)
+            }
+            "BreakStmt" => {
+                let target = *self
+                    .break_targets
+                    .last()
+                    .context("break outside of loop or switch")?;
+                self.set_jump(cur_bb, target);
+                Ok(self.new_block())
+            }
+            "ContinueStmt" => {
+                let target = *self
+                    .continue_targets
+                    .last()
+                    .context("continue outside of loop")?;
+                self.set_jump(cur_bb, target);
+                Ok(self.new_block())
+            }
+            "DeclStmt" => {
+                for declaration in inner {
+                    if kind(declaration) != "VarDecl" {
+                        continue;
+                    }
+                    let decl_id = text(declaration, "id");
+                    if self.static_or_extern_ids.contains(decl_id) {
+                        continue;
+                    }
+                    let (name, var_ty) = self
+                        .emitter
+                        .variables
+                        .get(decl_id)
+                        .cloned()
+                        .context("missing hoisted local variable")?;
+                    if let Some(init_node) = local_initializer(declaration)? {
+                        let (val, val_ty) = self.emitter.typed_expression(init_node)?;
+                        ensure!(
+                            var_ty.same_shape(&val_ty),
+                            "local initializer type mismatch"
+                        );
+                        self.blocks[cur_bb].stmts.push(format!("{name} = {val};"));
+                    }
+                }
+                Ok(cur_bb)
+            }
+            "NullStmt" => Ok(cur_bb),
+            _ => {
+                let expr = self.emitter.typed_expression(node)?.0;
+                self.blocks[cur_bb].stmts.push(format!("{expr};"));
+                Ok(cur_bb)
+            }
+        }
+    }
+
+    fn render(self, entry_bb: usize, exit_bb: usize) -> Result<String> {
+        let mut reachable = vec![false; self.blocks.len()];
+        let mut work = vec![entry_bb];
+        reachable[entry_bb] = true;
+        while let Some(bb) = work.pop() {
+            match &self.blocks[bb].term {
+                CfgTerm::Unreachable => bail!("CFG block {bb} missing terminator"),
+                CfgTerm::Jump(t) => {
+                    if !reachable[*t] {
+                        reachable[*t] = true;
+                        work.push(*t);
+                    }
+                }
+                CfgTerm::Branch {
+                    then_bb, else_bb, ..
+                } => {
+                    for &t in &[then_bb, else_bb] {
+                        if !reachable[*t] {
+                            reachable[*t] = true;
+                            work.push(*t);
+                        }
+                    }
+                }
+                CfgTerm::Switch {
+                    cases, default_bb, ..
+                } => {
+                    for &(_, t) in cases {
+                        if !reachable[t] {
+                            reachable[t] = true;
+                            work.push(t);
+                        }
+                    }
+                    if !reachable[*default_bb] {
+                        reachable[*default_bb] = true;
+                        work.push(*default_bb);
+                    }
+                }
+                CfgTerm::Return | CfgTerm::Exit => {}
+            }
+        }
+
+        let mut arms = Vec::new();
+        for (bb, block) in self.blocks.iter().enumerate() {
+            if !reachable[bb] {
+                continue;
+            }
+            if bb == exit_bb {
+                arms.push(format!("{bb} => break 'rf_cfg,"));
+                continue;
+            }
+            let mut body_lines = block.stmts.clone();
+            match &block.term {
+                CfgTerm::Jump(t) => body_lines.push(format!("rf_pc = {t};")),
+                CfgTerm::Branch {
+                    cond,
+                    then_bb,
+                    else_bb,
+                } => {
+                    body_lines.push(format!(
+                        "rf_pc = if {cond} {{ {then_bb} }} else {{ {else_bb} }};"
+                    ));
+                }
+                CfgTerm::Switch {
+                    sw_var,
+                    cases,
+                    default_bb,
+                } => {
+                    if cases.is_empty() {
+                        body_lines.push(format!("rf_pc = {default_bb};"));
+                    } else {
+                        let mut chain = String::from("if false {}");
+                        for (rhs, target) in cases {
+                            chain.push_str(&format!(
+                                " else if {sw_var} == ({rhs}) {{ rf_pc = {target}; }}"
+                            ));
+                        }
+                        chain.push_str(&format!(" else {{ rf_pc = {default_bb}; }}"));
+                        body_lines.push(chain);
+                    }
+                }
+                CfgTerm::Return => {}
+                CfgTerm::Exit | CfgTerm::Unreachable => unreachable!(),
+            }
+            arms.push(format!("{bb} => {{\n{}\n}}", body_lines.join("\n")));
+        }
+
+        Ok(format!(
+            "{}\nlet mut rf_pc: usize = {entry_bb};\n'rf_cfg: loop {{\nmatch rf_pc {{\n{}\n_ => unreachable!(),\n}}\n}}",
+            self.hoisted_items.join("\n"),
+            arms.join("\n"),
+        ))
     }
 }

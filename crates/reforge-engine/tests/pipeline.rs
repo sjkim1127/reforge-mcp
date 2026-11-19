@@ -1708,3 +1708,310 @@ int eval_gnu(int x) {
         gnu_rs
     );
 }
+
+#[test]
+fn general_c_profile_translates_variadic_globals_int128_fnptr_and_general_cfg() {
+    let workspace = Workspace::new();
+    let gen_c = workspace.source.join("general_features.c");
+    std::fs::write(
+        &gen_c,
+        r#"
+#include <stdio.h>
+
+extern int ext_bias;
+int tent_counter;
+int mut_acc = 5;
+
+static int add_one(int x) { return x + 1; }
+
+int duff_and_goto(int n, int (*fp)(int)) {
+    static int calls = 0;
+    register int sum = ext_bias + mut_acc;
+    int uninit_ok;
+    calls += 1;
+    sum += uninit_ok;
+
+    if (n <= 0) {
+        goto bail;
+    }
+
+    int i = 0;
+loop_top:
+    if (i < n) {
+        sum += (*fp)(i);
+        if (i == 2) {
+            goto after_loop;
+        }
+        i += 1;
+        goto loop_top;
+    }
+
+after_loop:
+    switch (n & 3) {
+        case 0:
+            if (calls > 0) {
+        case 1:
+                sum += 10;
+            }
+            break;
+        default:
+            sum += 1;
+            break;
+    }
+    tent_counter += calls;
+    mut_acc = sum;
+    return sum;
+
+bail:
+    return -1;
+}
+
+unsigned long long wide128_hi(unsigned int shift) {
+    __int128 s = -((__int128)1 << 70);
+    __uint128_t u = ((__uint128_t)1 << shift) ^ ((__uint128_t)(s < 0 ? 3 : 1));
+    return (unsigned long long)(u >> 64);
+}
+
+int fmt_greeting(char *buf, unsigned long cap, const char *who) {
+    return snprintf(buf, cap, "hi:%s:%d", who, mut_acc);
+}
+
+int main(void) {
+    char msg[32];
+    fmt_greeting(msg, sizeof(msg), "rust");
+    printf("%s %d %llu\n", msg, duff_and_goto(3, add_one), wide128_hi(72));
+}
+"#,
+    )
+    .unwrap();
+
+    let ast_out = std::process::Command::new("clang")
+        .args([
+            "-std=gnu11",
+            "-fno-builtin",
+            "-w",
+            "-Xclang",
+            "-ast-dump=json",
+            "-fsyntax-only",
+        ])
+        .arg(&gen_c)
+        .output()
+        .unwrap();
+    assert!(
+        ast_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ast_out.stderr)
+    );
+    let ast_json: serde_json::Value = serde_json::from_slice(&ast_out.stdout).unwrap();
+
+    // Default strict mode must still reject these constructs.
+    assert!(
+        reforge_engine::translate_ast(&ast_json, &gen_c, &workspace.source).is_err(),
+        "strict translate_ast must reject general-only constructs"
+    );
+
+    let tu = reforge_engine::translate_ast_with_options(
+        &ast_json,
+        &gen_c,
+        &workspace.source,
+        reforge_engine::TranslateOptions::general_c(),
+    )
+    .unwrap();
+    let gen_rs = format!(
+        "#![no_std]\n{}\n",
+        reforge_engine::render_rust_module(
+            &tu.structs,
+            &tu.constants,
+            &tu.prototypes,
+            &tu.functions
+        )
+    );
+    assert!(gen_rs.contains("rf_var_snprintf"));
+    assert!(gen_rs.contains("rf_var_printf"));
+    assert!(gen_rs.contains("u128"));
+    assert!(gen_rs.contains("i128"));
+    assert!(gen_rs.contains("'rf_cfg:"));
+
+    let rs_path = workspace.source.join("general_features.rs");
+    let rlib_path = workspace.source.join("libgeneral_features.rlib");
+    std::fs::write(&rs_path, &gen_rs).unwrap();
+    let rustc_out = std::process::Command::new("rustc")
+        .args(["--edition=2024", "--crate-type=rlib", "-o"])
+        .arg(&rlib_path)
+        .arg(&rs_path)
+        .output()
+        .unwrap();
+    assert!(
+        rustc_out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&rustc_out.stderr),
+        gen_rs
+    );
+}
+
+#[test]
+fn drop_in_c_abi_staticlib_links_and_matches_c_caller() {
+    let workspace = Workspace::new();
+    let lib_c = workspace.source.join("demo_lib.c");
+    std::fs::write(
+        &lib_c,
+        r#"
+#include <stdio.h>
+
+int g_total = 10;
+int g_hits;
+
+unsigned long long compute_and_format(
+    int n,
+    int (*cb)(int),
+    char *buf,
+    unsigned long cap
+) {
+    static int call_count = 0;
+    call_count += 1;
+    g_hits += call_count;
+
+    int acc = 0;
+    int i = 0;
+again:
+    if (i < n) {
+        acc += (*cb)(i);
+        i += 1;
+        goto again;
+    }
+
+    int j = 0;
+    switch (n & 1) {
+        case 0:
+            while (j < 2) {
+        case 1:
+                acc += 5;
+                j += 1;
+            }
+            break;
+    }
+
+    g_total += acc;
+    snprintf(buf, cap, "hits=%d total=%d", g_hits, g_total);
+
+    __uint128_t big = ((__uint128_t)1 << 65) + (__uint128_t)g_total;
+    return (unsigned long long)(big >> 1);
+}
+"#,
+    )
+    .unwrap();
+
+    let caller_c = workspace.source.join("caller.c");
+    std::fs::write(
+        &caller_c,
+        r#"
+#include <stdio.h>
+
+extern int g_total;
+extern int g_hits;
+extern unsigned long long compute_and_format(
+    int n,
+    int (*cb)(int),
+    char *buf,
+    unsigned long cap
+);
+
+static int dbl_plus_one(int x) {
+    return x * 2 + 1;
+}
+
+int main(void) {
+    char b1[64], b2[64];
+    unsigned long long r1 = compute_and_format(4, dbl_plus_one, b1, sizeof(b1));
+    unsigned long long r2 = compute_and_format(3, dbl_plus_one, b2, sizeof(b2));
+    printf("%llu|%s|%llu|%s|g=%d,%d\n", r1, b1, r2, b2, g_hits, g_total);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    let ast_out = std::process::Command::new("clang")
+        .args([
+            "-std=gnu11",
+            "-fno-builtin",
+            "-w",
+            "-Xclang",
+            "-ast-dump=json",
+            "-fsyntax-only",
+        ])
+        .arg(&lib_c)
+        .output()
+        .unwrap();
+    assert!(
+        ast_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ast_out.stderr)
+    );
+    let ast_json: serde_json::Value = serde_json::from_slice(&ast_out.stdout).unwrap();
+    let tu = reforge_engine::translate_ast_with_options(
+        &ast_json,
+        &lib_c,
+        &workspace.source,
+        reforge_engine::TranslateOptions::drop_in_c_abi(),
+    )
+    .unwrap();
+    let lib_rs = reforge_engine::render_rust_module(
+        &tu.structs,
+        &tu.constants,
+        &tu.prototypes,
+        &tu.functions,
+    );
+    let rs_path = workspace.source.join("demo_lib.rs");
+    let lib_a = workspace.source.join("libdemo_rs.a");
+    std::fs::write(&rs_path, &lib_rs).unwrap();
+
+    let rustc_out = std::process::Command::new("rustc")
+        .args(["--edition=2024", "-O", "--crate-type=staticlib", "-o"])
+        .arg(&lib_a)
+        .arg(&rs_path)
+        .output()
+        .unwrap();
+    assert!(
+        rustc_out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&rustc_out.stderr),
+        lib_rs
+    );
+
+    let c_bin = workspace.source.join("caller_c");
+    let rs_bin = workspace.source.join("caller_rs");
+    let c_link = std::process::Command::new("clang")
+        .args(["-O2", "-w"])
+        .arg(&caller_c)
+        .arg(&lib_c)
+        .arg("-o")
+        .arg(&c_bin)
+        .output()
+        .unwrap();
+    assert!(
+        c_link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&c_link.stderr)
+    );
+
+    let rs_link = std::process::Command::new("clang")
+        .args(["-O2", "-w"])
+        .arg(&caller_c)
+        .arg(&lib_a)
+        .arg("-o")
+        .arg(&rs_bin)
+        .output()
+        .unwrap();
+    assert!(
+        rs_link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rs_link.stderr)
+    );
+
+    let c_run = std::process::Command::new(&c_bin).output().unwrap();
+    let rs_run = std::process::Command::new(&rs_bin).output().unwrap();
+    assert_eq!(c_run.status.code(), Some(0));
+    assert_eq!(rs_run.status.code(), Some(0));
+    assert_eq!(c_run.stdout, rs_run.stdout);
+}
