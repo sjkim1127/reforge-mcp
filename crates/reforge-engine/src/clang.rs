@@ -509,10 +509,7 @@ fn is_const_qualified(type_obj: &Value) -> bool {
                 return true;
             }
         }
-        if !s.contains('*') && s.starts_with("const ") {
-            return true;
-        }
-        false
+        !s.contains('*') && s.starts_with("const ")
     };
     check(qual) || (!desugared.is_empty() && check(desugared))
 }
