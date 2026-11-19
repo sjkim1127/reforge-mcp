@@ -784,13 +784,17 @@ fn resolve_anon_record_type<'a>(
         return None;
     };
     let rest = base_raw.strip_suffix(')')?;
-    let at_pos = rest
-        .rfind("unnamed at ")
-        .map(|i| i + "unnamed at ".len())
-        .or_else(|| {
-            rest.rfind("anonymous at ")
-                .map(|i| i + "anonymous at ".len())
-        })?;
+    let at_pos = [
+        "unnamed at ",
+        "unnamed struct at ",
+        "unnamed union at ",
+        "anonymous at ",
+        "anonymous struct at ",
+        "anonymous union at ",
+    ]
+    .iter()
+    .filter_map(|m| rest.rfind(m).map(|i| i + m.len()))
+    .max()?;
     let loc_str = &rest[at_pos..];
     let mut parts = loc_str.rsplitn(3, ':');
     let col = parts.next()?.parse::<usize>().ok()?;
@@ -1938,11 +1942,17 @@ pub fn translate_with_options(
                     continue;
                 }
                 let inner = children(node);
-                if let Some(first) = inner.first()
-                    && kind(first) == "RecordType"
-                    && text(&first["decl"], "name").is_empty()
+                let mut ty_node = inner.first();
+                while let Some(cur) = ty_node
+                    && kind(cur) == "ElaboratedType"
                 {
-                    let decl_id = text(&first["decl"], "id");
+                    ty_node = children(cur).first();
+                }
+                if let Some(rec_ty) = ty_node
+                    && kind(rec_ty) == "RecordType"
+                    && text(&rec_ty["decl"], "name").is_empty()
+                {
+                    let decl_id = text(&rec_ty["decl"], "id");
                     if !decl_id.is_empty() {
                         let tag = anon_tags
                             .get(decl_id)
