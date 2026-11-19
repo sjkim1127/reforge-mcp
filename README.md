@@ -1,92 +1,114 @@
-# Reforge-MCP
+<p align="center">
+  <img src="docs/assets/logo.svg" width="140" height="140" alt="Reforge-MCP monochrome logo">
+</p>
 
-**C·C++·Java·Python·Go 프로그램과 의존 생태계를 Rust로 자동 이전하는 Agent용 MCP 인프라**를 목표로 합니다. Linux 커널, Ghidra, Spring Boot는 대표 검증 대상이며 프로젝트 규모의 상한을 두는 기준이 아닙니다. 기존 프로젝트 이름은 Fossil-MCP입니다.
+<h1 align="center">Reforge-MCP</h1>
 
-## 제품 방향
+<p align="center">
+  <em>Agent-oriented MCP infrastructure for verified migration of C/system software and its dependency ecosystem to Rust.</em>
+</p>
 
-원본 코드의 기계적 변환과 라이브러리·프레임워크 대체를 하나의 이전 작업 그래프로 연결합니다. Agent는 실제로 사용된 API와 동작 계약을 분석하고, Rust 후보를 찾아 직접 대체·어댑터·여러 라이브러리 조합·의존성 자체 포팅 중 적절한 경로를 선택한 뒤 실행 검증을 수행합니다. 같은 기능의 Rust 라이브러리가 없으면 해당 의존성도 별도 포팅 작업이 됩니다.
+<p align="center">
+  <strong>English</strong> · <a href="docs/README_KO.md">한국어</a>
+</p>
 
-전체 프로그램과 생태계의 완전 자동 이전은 장기 제품 목표입니다. 현재 실행 가능한 구현은 제한된 C 백엔드와 캠페인·의존성 계약 검증 기반입니다. 최상위 아키텍처와 우선순위는 [프로그램·생태계 이전 설계](docs/ecosystem-migration-design.md)를 따르며, [커널 로드맵](docs/kernel-scale-roadmap.md)은 시스템 프로파일의 설계입니다.
+Reforge-MCP (formerly Fossil-MCP) targets automated porting of C, C++, Java, Python, and Go programs—alongside their dependency graphs—to Rust. Representative benchmark targets include kernel subsystems, general-purpose C libraries, Ghidra, and Spring Boot without imposing architectural upper bounds on project size.
 
-AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록 MCP 서버가 분석 근거, 의존성 순서, 작업 상태, 컴파일 진단, 동작 비교 결과를 제공합니다. 최종 목표는 이 과정을 자동으로 반복하는 포팅 파이프라인입니다.
+---
+
+## Product Direction
+
+Reforge-MCP unifies source translation and library/framework replacement inside a single persistent migration graph. An AI agent analyzes actual API usage and behavioral contracts, chooses an appropriate dependency strategy (direct Rust crate replacement, typed adapter, multi-crate composition, recursive sub-campaign porting, or temporary FFI), and validates behavior against real execution fixtures.
+
+End-to-end migration of entire ecosystems is the long-term product objective. What is executable today is the **typed C-to-Rust backend** (supporting both Linux kernel-scale `no_std`/Kbuild and general-purpose user-space C) paired with the **persistent campaign & dependency contract verification lifecycle**. See [Ecosystem Migration Design](docs/ecosystem-migration-design.md) and [Kernel-Scale Roadmap](docs/kernel-scale-roadmap.md) for architecture details.
 
 ```text
-원본 프로젝트 → 분석 → 포팅 계획 → Rust 후보 생성
-                                  ↑          ↓
-                              수정 피드백 ← 검증
-                                             ↓
-                               검증 결과와 미지원 항목 보고
+Source Project ─▶ Clang AST Analysis ─▶ Dependency Plan ─▶ Rust Generation / Agent Candidate
+                                              ▲                        │
+                                      Diagnostic Feedback ◀─── Differential Verification
+                                                                       │
+                                                       Persistent Evidence & Fail-Closed Report
 ```
 
-첫 구현은 Clang AST를 읽어 제한된 C 함수를 Rust로 직접 변환하는 생성기입니다. AI 에이전트가 후보를 제출하는 경로도 제공합니다. Joern은 후속 분석 백엔드로 연결할 계획입니다.
+---
 
-캠페인 인벤토리와 Agent의 의존성 티켓·후보·어댑터 계획·계약 검증 수명주기를 구현했습니다. 다음 우선순위는 **빌드/패키지 수집기 → 공통 타입/동작 모델 → 프로파일별 빌드/실행 worker → 자동 반복**입니다. 큰 프로젝트는 모듈과 단위 작업으로 나눠 저장·증분 분석·재개하며, 함수 테스트나 crate 검색 결과만으로 전체 이전 완료를 보고하지 않습니다.
+## Current Implementation Status
 
-## 현재 구현 상태
-
-| 기능 | 상태 |
+| Capability | Status |
 |---|---|
-| C 분석과 소스 스냅샷 | Clang AST, `compile_commands.json`, `CMakeLists.txt`/`Makefile`/재귀 Kbuild/`.config` 수집, 파일/내용 해시, 헤더·매크로 전처리, 미지원 구문 거부 |
-| 포팅 계획과 컨텍스트 | 함수 의존성 순서, 재귀 그룹, 포인터 접근·소유권 계약(`pointer_contracts`), 구조체·union·상수·외부 심볼·Kconfig 목록, 원본 범위와 Rust 대응 |
-| Rust 자동 생성 | 부호/무부호·고정폭 정수·`float`/`double`·enum·`void`·구조체/union·비트필드·배열(문자열 패딩 포함)·포인터·함수 포인터(`extern "C"`)·`rf_safe_*` 안전 래퍼·문자열·`static const`·루프·`switch`·전방 `goto`·`sizeof`·`malloc`/libc/builtin 호출, `rf_abi_*` 내보내기 및 커널 `#![no_std]`/`Kbuild`/`rf_port_bindings.h` 어댑터 |
-| AI 후보 제출 | `src/lib.rs`를 새 시도로 저장; 자동 생성 후보와 같은 검증 경로 사용 |
-| 원본/Rust 차등 검증 | C UBSan(`-lm` 링크), offline Cargo 빌드, `#![no_std]` rlib 및 C 바인딩 헤더 검증, 양방향 C↔Rust FFI 경계 링크, 동일 입력의 stdout/stderr/종료 코드 비교 |
-| 작업 저장과 재개 | SQLite 작업/이벤트, 생성·검증 이력, 소스/후보 변경 시 검증 만료 |
-| 캠페인 인벤토리 | 파일 해시, 언어/빌드 manifest 발견, 페이지 조회, 소스 컨텍스트 |
-| 의존성 이전 수명주기 | Agent 작성 계약·후보, 어댑터 계획, 하위 캠페인 연결, JSON 실행 차등 검증 |
-| 저장소 검색과 일반 로드맵 | 기존 구현 유지 |
-| C++·Java·Python·Go 포팅, Joern, 모델 기반 자동 수정 | 계획 |
+| **C Analysis & Source Snapshots** | Clang JSON AST, `compile_commands.json`, `CMakeLists.txt` / `Makefile` / recursive `Kbuild` & `.config` collection, automatic `.h` subdirectory `-I` discovery, header/source SHA-256 tracking, fail-closed rejection of unsupported constructs |
+| **Planning & Context Inspection** | SCC dependency-ordered translation units, recursive function groups, pointer ownership/mutability inference (`pointer_contracts`), struct/union/constant/extern symbol maps, Kconfig flags, and line-level provenance |
+| **Deterministic Rust Generation** | Signed/unsigned/fixed-width integers, `float`/`double`, enums, `void`, `#[repr(C)]` structs/unions, bitfields, fixed & string-padded char arrays, raw pointers with runtime null checks (`rf_ptr`), `Option<extern "C" fn>` function pointers, `rf_safe_*` safe reference wrappers, `static const` tables, loops, `switch` fallthrough, forward `goto` cleanup labels, definite-init locals, `malloc`/libc/compiler builtins, `rf_abi_*` exports, and kernel `#![no_std]` / `Kbuild` / `rf_port_bindings.h` output |
+| **Agent Candidate Path** | `submit_rust_candidate` persists agent-authored `src/lib.rs` attempts under content hashing and runs the exact same verification gates |
+| **Differential Verification** | C source compiled with `-fsanitize=undefined` and `-lm`, offline dependency-free Cargo build, `#![no_std]` `rlib` build check (`compile-kernel-nostd`), C11 header syntax check (`check-kernel-bindings-header`), bidirectional C↔Rust FFI object linking, and stdout/stderr/exit-code parity comparison |
+| **Persistence & Tamper Invalidation** | SQLite job/event store, attempt history across restarts, and automatic `stale` invalidation if source, headers, `.config`, manifests, or candidates change |
+| **Campaign Inventory** | File hashing, build/manifest discovery, paginated inventory inspection, and source context lookup |
+| **Dependency Migration Lifecycle** | Agent-authored dependency contracts & candidates, adapter planning, child sub-campaigns, and JSON execution differential verification |
+| **Code Search & General Roadmaps** | Preserved (`clone_reference`, `index_repo`, `locate_implementation`, `get_symbol_source`, SQLite roadmaps) |
+| **C++ / Java / Python / Go, Joern CPG, Autonomous Repair** | Planned |
 
-현재 C 지원 범위는 커널 C뿐 아니라 범용 사용자 공간 C 라이브러리까지 포함합니다. 부호/무부호/고정 폭 정수(`int8_t`–`int64_t`, `uint8_t`–`uint64_t`, `u8`–`u64`, `s8`–`s64`, `size_t`, `ptrdiff_t`, `intptr_t`/`uintptr_t`, `bool`), 부동소수점(`float`, `double`), `enum`, `void`, 구조체/공용체(`struct`, `union`, `typedef`), 비트필드, 고정 크기 배열, 포인터(`int *`, `const int *`, `struct *`, `union *`, `void *`, 포인터↔정수 캐스트), C ABI 함수 포인터(`Option<extern "C" fn>`), 문자열 리터럴, 파일 스코프 `static const` 상수·테이블, `sizeof`/`alignof`를 사용하는 C 함수를 지원합니다. 부호 있는 checked / 무부호 wrapping 산술·부동소수점 사칙/비교/변환·시프트(`<<`, `>>`)·논리·비트 연산, 복합 대입(`+=`, `-=`, `*=` 등), 전/후위 `++`/`--`, 분기, `switch`/`case`/`default`(fallthrough 포함), 루프(`for`, `while`, `do-while`, `break`, `continue`), 전방 `goto` 에러 정리 레이블, 초기화된 지역 변수, 직접·간접 호출, 표준 C 동적 힙/문자열/수학/builtin(`malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `strlen`, `strcmp`, `qsort`, `<math.h>`, `__builtin_bswap*`/`clz`/`ctz`/`popcount`/`expect`/`fabs*`), 외부 C 프로토타입(`unsafe extern "C"`), C FFI 경계 파일(`ffi/`, `external/`, `*.ffi.c`, `*.external.c`) 및 양방향 `rf_abi_*` C ABI 내보내기를 지원하며, 자동 생성 시 `kbuild/rf_kernel_port.rs`(`#![no_std]`), `kbuild/Kbuild`, `kbuild/rf_port_bindings.h` 어댑터 출력을 함께 생성·검증합니다. `CMakeLists.txt`(`add_compile_definitions`, `add_definitions`, `include_directories`, `add_subdirectory`), 일반 `Makefile`(`CFLAGS`, `CPPFLAGS`, `SUBDIRS`), `.config`·재귀 `Kbuild`·`compile_commands.json`, include guard, 매크로, 조건부 컴파일, 헤더의 구조체·union·enum·상수·함수 선언과 공유 inline 함수도 지원합니다. 가변 전역 상태, `static` 지역 변수, 미초기화 지역 변수, 역방향/교차 스코프 `goto`, 인라인 어셈블리, 가변 인자, `main`, `_Complex`는 거부합니다. 프로젝트 한도는 4,096파일, 총 64 MiB입니다. 시스템 헤더의 선언은 원본 함수로 잘못 변환하지 않으며, 프로젝트/외부 include 파일과 `.config`/`Kbuild`/`CMakeLists.txt`의 해시를 기록해 변경 시 검증을 만료시킵니다.
+### Supported C Language Scope
 
-`completed`는 **선택한 진입 함수와 제공한 fixture가 최신 소스/후보에서 일치했다**는 뜻입니다. 전체 프로그램 동등성이나 모든 입력에 대한 보장은 아닙니다. C 원본의 UB, 빌드 실패, 타임아웃은 검증 성공으로 처리하지 않습니다.
+- **Types**: signed/unsigned/`_Bool`/fixed-width integers (`int8_t`–`int64_t`, `uint8_t`–`uint64_t`, `u8`–`u64`, `s8`–`s64`, `size_t`, `ptrdiff_t`, `intptr_t`/`uintptr_t`), `float`/`double`, `enum`, `void`, `struct`/`union`/`typedef`, bitfields, fixed-size arrays, string-padded `char` arrays, raw pointers (`int *`, `const int *`, `struct *`, `union *`, `void *`, nested pointers, pointer↔integer casts), and C ABI function pointers (`Option<extern "C" fn(...)>`).
+- **Control Flow & Semantics**: checked signed vs. wrapping unsigned integer arithmetic, IEEE-754 floating-point arithmetic/casts/comparisons, shifts (`<<`, `>>`), bitwise/logical operators, compound assignments (`+=`, `-=`, `*=` including mixed int/float), prefix/postfix `++`/`--`, `if`/`else`, `switch`/`case`/`default` with fallthrough, `for`/`while`/`do-while` with `break`/`continue`, forward `goto` error-cleanup labels, definite-initialization tracking for locals (`int x;` allowed when assigned or address-taken before read), `sizeof`/`alignof`, and file-scope `static const` tables and string literals.
+- **Stdlib, Builtins & FFI**: `<stdlib.h>` heap APIs (`malloc`, `calloc`, `realloc`, `free`, `qsort`), `<string.h>`/`<math.h>`, GCC/Clang builtins (`__builtin_add/sub/mul_overflow` & typed variants, `__builtin_bswap*`, `clz*`, `ctz*`, `popcount*`, `ffs*`, `parity*`, `rotateleft*`/`rotateright*`, `__builtin_expect`, `__builtin_constant_p`, `__builtin___memcpy/memmove/memset/strcpy/strncpy_chk`, `__builtin_isnan`/`isfinite`/`isinf`/`signbit*`/`fabs*`/`inf*`/`nan*`), external C prototypes (`unsafe extern "C"`), C boundary files (`ffi/`, `external/`, `*.ffi.c`, `*.external.c`), bidirectional C ABI exports (`rf_abi_*`), and inferred safe Rust wrappers (`rf_safe_*`) when pointer parameters satisfy single-element borrow semantics.
+- **Kernel & General Build Contexts**: `compile_commands.json`, `CMakeLists.txt` (`add_compile_definitions`, `add_definitions`, `include_directories`, `add_subdirectory`), `Makefile` (`CFLAGS`, `CPPFLAGS`, `SUBDIRS`), recursive `Kbuild` & `.config` (`CONFIG_*`, `ccflags-y`, `obj-y`/`obj-m`/`obj-n`), automatic header directory `-I` discovery, include guards, macros, and shared header `inline` functions—up to **4,096 files** and **64 MiB** total source.
+- **Kernel Output Adapter**: deterministic generation emits `kbuild/rf_kernel_port.rs` (`#![no_std]`), `kbuild/Kbuild`, and `kbuild/rf_port_bindings.h`, verified during `verify_port`.
+- **Fail-Closed Exclusions**: mutable global variables, `static` locals, reads of uninitialized locals, backward/cross-scope `goto`, inline assembly, variadic functions, `main`, and `_Complex`.
 
-## 캠페인과 의존성 이전 흐름
+> **Verification Policy**: `"completed"` means the selected entry function passed all submitted fixtures against the pinned source and latest candidate without undefined behavior. It does not claim whole-program equivalence over untested inputs or execution contexts. Source undefined behavior (caught via UBSan), build failures, or timeouts block completion.
 
-1. `inventory_project`로 프로젝트를 등록하고 `get_migration_inventory`, `get_migration_source_context`로 파일과 실제 API 사용을 조사합니다.
-2. `register_dependency_requirements`로 의존성 버전, 사용하는 API, 소스 줄 범위, 미확인 사용과 필수 동작 계약을 등록합니다.
-3. Agent가 Rust 후보를 조사하고 구현한 뒤 `record_dependency_candidate`로 버전·문서 URL·라이선스·타깃·API 대응·누락 기능을 제출합니다. `plan_dependency_adapter`는 계획을 저장하며 코드를 생성하지 않습니다.
-4. 후보가 없으면 `create_dependency_campaign`으로 의존성 자체의 포팅 작업을 연결합니다. 직접 대체, 어댑터, 여러 Rust 라이브러리 조합, 의존성 포팅, 임시 FFI 전략을 기록할 수 있습니다.
-5. Agent가 원본/후보 실행 파일 또는 launcher를 **각 프로젝트 내부에 준비**합니다. `verify_dependency_replacement`는 같은 fixture argv로 실행하고 비어 있지 않은 JSON 객체/배열, stderr, 종료 코드를 비교합니다. 모든 필수 계약에 사례가 있어야 하며 미확인 사용·누락 기능·API 대응 누락은 수용을 차단합니다.
-6. `get_dependency_requirements`, `get_migration_campaign`, `next_migration_tasks`로 근거와 다음 작업을 읽습니다. `revise_dependency_requirements`는 수정할 때마다 이전 수용 근거를 만료시킵니다.
+---
 
-`accepted_fixture_scope`는 제출된 계약 사례의 통과입니다. 임시 FFI는 `verified_temporary_ffi`로 별도 표시합니다. 원본·후보·실행 파일 변경 및 중단된 검증은 수용 근거가 되지 않습니다. 의존성이 통과해도 `program_migration_completed`는 `false`이며 프로그램 변환·통합이 남습니다.
+## C-to-Rust Porting Workflow
 
-현재 인벤토리는 파일/manifest 발견이며 Maven/Gradle 패키지 해석이나 API 사용 자동 분석을 수행하지 않습니다. 후보 URL/라이선스/버전과 사용 범위는 Agent가 제출한 정보입니다. 서버 내부 registry 검색, 자동 어댑터 생성, 의존성 probe 빌드, 동적 런타임 환경 fingerprint는 아직 구현 전입니다. 이 API의 실행 계약과 한도는 [캠페인 가이드](docs/migration-campaigns.md)를 참고합니다.
+1. `analyze_porting_project({"source_path": "/absolute/path/to/c-project"})`
+2. `create_porting_plan({"job_id": "..."})`
+3. `generate_rust({"job_id": "..."})` for deterministic translation, or inspect `get_porting_context` and submit agent code via `submit_rust_candidate`
+4. `verify_port({"job_id": "...", "entry_function": "score", "cases": [[-7, 3], [0, 0], [200, 10]]})`
+5. `get_porting_report({"job_id": "..."})` for verification status, build/execution logs, `pointer_contracts`, and `kbuild/` artifacts
 
-## 포팅 실행 흐름
+Across server restarts, use `list_porting_jobs({})` to resume or inspect existing jobs. Submitting a new candidate creates a new numbered attempt while preserving historical verification records.
 
-1. `analyze_porting_project({"source_path":"/absolute/path/to/c-library"})`
-2. 반환된 `job_id`로 `create_porting_plan({"job_id":"..."})`
-3. `generate_rust({"job_id":"..."})`로 자동 생성하거나, `get_porting_context`를 읽고 `submit_rust_candidate`로 Rust 후보 제출
-4. `verify_port({"job_id":"...","entry_function":"score","cases":[[-7,3],[0,0],[200,10]]})`
-5. `get_porting_report({"job_id":"..."})`로 검증 결과·로그·아티팩트 경로 확인
-
-재시작 후에는 `list_porting_jobs({})`로 작업을 찾아 보고서를 읽습니다. 실패한 후보를 수정해 제출하면 새 생성 시도가 생기며 이전 검증 기록은 유지됩니다. 원본이 바뀌면 새 분석 작업을 만들어야 합니다.
-
-| 도구 | 역할 |
+| Tool | Purpose |
 |---|---|
-| `get_porting_capabilities` | 구현 범위·필수 도구·실행 한계 조회 |
-| `analyze_porting_project` | 스냅샷 생성 및 Clang 분석 |
-| `create_porting_plan` | 의존성 순서와 검증 계약 생성 |
-| `get_porting_context` | 함수별 원본·타입·호출·Rust 대응 조회 |
-| `generate_rust` | 결정적 Rust 생성 및 Cargo 프로젝트 작성 |
-| `submit_rust_candidate` | 에이전트가 작성한 `src/lib.rs` 저장 |
-| `verify_port` | 원본/Rust 빌드·실행 비교와 evidence 저장 |
-| `get_porting_report` | 현재 상태, 검증 이력, 변경 감지 조회 |
-| `list_porting_jobs` | 최근 100개 저장 작업 조회 |
+| `get_porting_capabilities` | Inspect supported C scope, required tools, and execution limits |
+| `analyze_porting_project` | Snapshot project files and run Clang AST + build-context analysis |
+| `create_porting_plan` | Produce SCC dependency ordering and verification contract |
+| `get_porting_context` | Inspect per-function source, types, pointer contracts, and Rust correspondence |
+| `generate_rust` | Emit deterministic Cargo (`src/lib.rs`) + `no_std` Kbuild artifacts (`kbuild/*`) |
+| `submit_rust_candidate` | Persist agent-authored `src/lib.rs` as a new candidate attempt |
+| `verify_port` | Compile/run C (UBSan) vs. Rust (`cargo`, `no_std`, header check) differential harness |
+| `get_porting_report` | Retrieve current job state, evidence, commands, and tamper/staleness checks |
+| `list_porting_jobs` | List the most recent 100 persisted porting jobs |
 
-검증은 로컬 호스트에서 코드를 실행합니다. 명령은 셸 없이 실행하고 컴파일/실행 시간과 출력량을 제한하며 Unix에서는 프로세스 그룹을 정리합니다. 현재 OS 격리 sandbox는 제공하지 않습니다. 생성 시도는 작업당 32회, 검증은 64회, 한 검증의 fixture는 1–256개로 제한합니다. 분석/검증 한 번의 전체 시간은 120초, 각 fixture 실행은 10초, 프로세스별 stdout/stderr는 각각 8 MiB로 제한합니다.
+Verification executes on the local host without OS container isolation, enforcing direct command invocation (no shell), process-group cleanup on Unix, and bounded budgets: max 32 generation attempts/job, max 64 verifications/job, 1–256 cases/run, 120 s overall operation timeout, 10 s per-case timeout, and 8 MiB per-stream output cap.
 
-## 시작하기
+---
 
-서버 빌드는 Rust 1.88 이상이 필요합니다. 포팅 분석/검증에는 PATH의 `clang`(JSON AST 및 UBSan 지원), `rustc`, `cargo`가 필요합니다. 내부 `fossil-*` 크레이트 이름은 기존 이름을 사용합니다.
+## Migration Campaigns & Dependency Lifecycle
+
+1. Register a repository with `inventory_project` and inspect paginated files/usage via `get_migration_inventory` and `get_migration_source_context`.
+2. Record dependency versions, consumed APIs, line ranges, unknown usage, and mandatory behavioral contracts via `register_dependency_requirements`.
+3. Submit agent research & implementation metadata with `record_dependency_candidate`, store integration notes with `plan_dependency_adapter`, or link recursive sub-campaigns via `create_dependency_campaign`.
+4. Prepare source/candidate executables inside each project and run `verify_dependency_replacement` to diff non-empty JSON stdout, stderr, and exit codes across required contracts.
+5. Track next actions with `get_dependency_requirements`, `get_migration_campaign`, and `next_migration_tasks` (`revise_dependency_requirements` invalidates prior acceptance).
+
+`accepted_fixture_scope` reflects passing the submitted contract fixtures (temporary FFI replacements are tracked separately as `verified_temporary_ffi`), while `program_migration_completed` remains `false` until full program integration is verified. See [Migration Campaigns Guide](docs/migration-campaigns.md).
+
+---
+
+## Getting Started
+
+Building `reforge-mcp` requires **Rust 1.88+**. Running C analysis and differential verification requires `clang` (with JSON AST dump and UBSan), `rustc`, and `cargo` on `PATH`.
 
 ```bash
 git clone https://github.com/sjkim1127/reforge-mcp
 cd reforge-mcp
 cargo build --release --locked --bin reforge-mcp
 ```
+
+Add the MCP server to your client config:
 
 ```json
 {
@@ -98,11 +120,11 @@ cargo build --release --locked --bin reforge-mcp
 }
 ```
 
-첫 호출은 `get_porting_capabilities({})`입니다. 기존 검색은 `clone_reference → index_repo → locate_implementation → get_symbol_source` 순서로 사용합니다.
+State is stored under `REFORGE_DATA_DIR` (defaulting to the OS cache directory under `reforge-mcp`): SQLite `porting.db`, pinned snapshots, generated `candidates/<attempt>/` (`Cargo.toml`, `src/lib.rs`, `kbuild/*`), and verification logs in `verification/<attempt>/logs/`.
 
-포팅 데이터는 `REFORGE_DATA_DIR` 아래 `porting.db`와 `jobs/<job_id>/`에 저장됩니다. 기본값은 OS 캐시 디렉터리의 `reforge-mcp`입니다. 생성 결과는 `candidates/<attempt>/Cargo.toml`과 `src/lib.rs`, 검증 로그는 `verification/<attempt>/logs/`에서 확인할 수 있습니다. 기존 검색 캐시와 포팅 작업 저장소는 분리되어 있습니다.
+---
 
-## 재현 가능한 MCP 데모
+## Reproducible MCP Smoke Demos
 
 ```bash
 cargo build --locked --bin reforge-mcp
@@ -110,21 +132,21 @@ python3 scripts/porting_smoke.py
 python3 scripts/campaign_smoke.py
 ```
 
-실제 stdio MCP 연결을 통해 2개의 C 파일·3개 함수로 구성된 fixture를 Rust로 변환하고 6개 입력을 비교합니다. 서버 재시작 후 결과 재조회와 미지원 구문(전역 상태) 입력의 거부도 검사합니다. `.reforge-demo/report.json`에 실행 근거를 저장합니다. 추가로 헤더/매크로 프로젝트 6개 입력과, 커밋을 고정한 실제 [musl `abs.c`](fixtures/porting/musl-abs/PROVENANCE.md) 6개 입력을 검증합니다. `INT_MIN`에서 musl 원본의 UB를 검출해 완료를 차단하는 것도 확인합니다. 결과는 `.reforge-demo/headers-report.json`, `.reforge-demo/musl-abs-report.json`에 저장합니다. musl 검증은 실제 함수 하나에 한정되며 전체 musl 포팅이나 외부 프로젝트 corpus 수용 검증은 아닙니다.
+- `porting_smoke.py`: drives the stdio MCP server over arithmetic fixtures (6 cases), server restart/resume, global-state rejection, header/macro fixtures (6 cases), and pinned [musl `abs.c`](fixtures/porting/musl-abs/PROVENANCE.md) (6 defined cases passing + `INT_MIN` UB blocked), writing artifacts under `.reforge-demo/`.
+- `campaign_smoke.py`: verifies dependency contract matching between C `strtol` and a Rust parser candidate (8 cases), mismatch rejection, revision invalidation, and restart persistence into `.reforge-demo/campaign-report.json`.
 
-캠페인 데모는 실제 C `strtol`과 Rust 표준 라이브러리 파싱을 비교합니다. 공백·오류 처리 계약을 빠뜨린 후보의 실패, 작성된 어댑터의 8개 입력 통과, 계약 수정 후 검증 만료 및 재시작 후 조회를 확인합니다. `.reforge-demo/campaign-report.json`에 저장됩니다. probe와 어댑터는 사람이 작성한 fixture이며 자동 의존성 포팅 결과는 아닙니다.
+---
 
-## 전환 및 호환성
+## Compatibility, Documentation & Development
 
-실행 파일 이름은 `fossil-mcp`에서 `reforge-mcp`로 변경됩니다. 기존 MCP 설정의 command 경로를 갱신해야 합니다. 릴리즈 아카이브도 새 이름을 사용합니다. 기존 로컬 데이터 재사용을 위해 `FOSSIL_CACHE_DIR`, `FOSSIL_LOG`와 SQLite 저장 경로는 유지합니다. GitHub 저장소는 `sjkim1127/reforge-mcp`로 변경했습니다. 기존 로컬 체크아웃 폴더는 그대로 사용해도 됩니다.
-
-## 설계와 개발
-
-- [프로그램·생태계 Rust 이전과 Agent 의존성 해결](docs/ecosystem-migration-design.md)
-- [시스템/커널 전용 프로파일](docs/kernel-scale-roadmap.md)
-- [현재 엔진 설계 및 단계별 완료 기준](docs/rust-porting-design.md)
-- [기존 도구 계약과 운영 참고](docs/fossil-reference.md): 전환 전 문서이며 실행 파일 이름은 위 설정을 따릅니다.
-- [릴리즈 절차](RELEASING.md)
+- **Rebrand compatibility**: binary name changed from `fossil-mcp` to `reforge-mcp` (update MCP `command` paths), while `FOSSIL_CACHE_DIR`, `FOSSIL_LOG`, internal `fossil-*` crate names, and existing SQLite paths are preserved.
+- **Design docs**:
+  - [Ecosystem Migration Design](docs/ecosystem-migration-design.md)
+  - [Kernel-Scale Roadmap](docs/kernel-scale-roadmap.md)
+  - [Rust Porting Engine Design](docs/rust-porting-design.md)
+  - [Migration Campaigns Contract](docs/migration-campaigns.md)
+  - [Legacy Tool Reference](docs/fossil-reference.md)
+  - [Release Process](RELEASING.md)
 
 ```bash
 cargo fmt --all -- --check
