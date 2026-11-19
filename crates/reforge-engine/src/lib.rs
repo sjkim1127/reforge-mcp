@@ -413,8 +413,8 @@ impl Engine {
             "kernel_profile": job.kernel_profile,
             "kbuild_artifacts": job.kbuild_artifacts,
             "verification_contract": {
-                "parameter_type": "integer | *mut i32",
-                "return_type": "integer | ()",
+                "parameter_type": "integer | float | double | *mut i32",
+                "return_type": "integer | float | double | ()",
                 "minimum_cases": 1,
                 "maximum_cases": 256,
                 "source_undefined_behavior": "blocks_acceptance",
@@ -452,7 +452,7 @@ impl Engine {
             "translation_unit_source": source,
             "source_sha256": job.source_snapshot_sha256,
             "unsupported": job.unsupported,
-            "semantics": "fixed-width/unsigned/bool/platform integers, enums, void, repr(C) structs/unions, bitfields, fixed-size arrays, raw pointers (*mut T with null check), function pointers (Option<fn>), string literals, static const globals, loops (for/while/do-while/break/continue), switch/case/default, forward goto cleanup labels, sizeof/alignof, extern C calls, C ABI exports (rf_abi_*), compile_commands.json, and recursive Kbuild/Kconfig (.config); checked signed vs wrapping unsigned arithmetic; include dependencies hashed"
+            "semantics": "fixed-width/unsigned/bool/platform integers, float/double, enums, void, repr(C) structs/unions, bitfields, fixed-size arrays, raw pointers (*mut T with null check, ptr-int casts), function pointers (Option<extern \"C\" fn>), string literals, static const globals, loops (for/while/do-while/break/continue), switch/case/default, forward goto cleanup labels, sizeof/alignof, libc/heap/builtins (malloc/free/memcpy/memset/memmove/qsort/__builtin_*), C ABI exports (rf_abi_*), compile_commands.json, CMake/Makefile and recursive Kbuild/Kconfig (.config); checked signed vs wrapping unsigned arithmetic; include dependencies hashed"
         }))
     }
     pub fn generate(&self, id: &str) -> Result<Job> {
@@ -465,7 +465,7 @@ impl Engine {
             "create_porting_plan must be called before generation"
         );
         let mut rust = String::from(
-            "#![allow(unused_mut, unused_parens, unreachable_code, non_camel_case_types, non_snake_case, dead_code, unused_unsafe, unused_labels, improper_ctypes_definitions)]\n#[inline]\nfn rf_ptr<T>(ptr: *mut T) -> *mut T {\n    assert!(!ptr.is_null(), \"null pointer dereference\");\n    ptr\n}\n",
+            "#![allow(unused_mut, unused_parens, unreachable_code, non_camel_case_types, non_snake_case, dead_code, unused_unsafe, unused_labels, improper_ctypes, improper_ctypes_definitions)]\n#[inline]\nfn rf_ptr<T>(ptr: *mut T) -> *mut T {\n    assert!(!ptr.is_null(), \"null pointer dereference\");\n    ptr\n}\n",
         );
         for sdef in &job.structs {
             rust.push_str(&sdef.rust);
@@ -626,8 +626,9 @@ impl Engine {
         for pty in &param_types {
             ensure!(
                 is_supported_entry_int(pty).is_some()
+                    || is_supported_entry_float(pty).is_some()
                     || matches!(pty.as_str(), "int *" | "const int *"),
-                "verify_port entry parameter type {pty:?} requires an integer or int* wrapper entry"
+                "verify_port entry parameter type {pty:?} requires a scalar number or int* wrapper entry"
             );
         }
         let return_type = if function.return_type.is_empty() {
@@ -636,8 +637,10 @@ impl Engine {
             function.return_type.clone()
         };
         ensure!(
-            return_type == "void" || is_supported_entry_int(&return_type).is_some(),
-            "verify_port entry return type {return_type:?} requires an integer or void wrapper entry"
+            return_type == "void"
+                || is_supported_entry_int(&return_type).is_some()
+                || is_supported_entry_float(&return_type).is_some(),
+            "verify_port entry return type {return_type:?} requires a scalar number or void wrapper entry"
         );
         job.state = "verifying".into();
         job.last_error = None;
@@ -755,6 +758,21 @@ impl Engine {
             }
             body.push_str(" if (!rf_printed) printf(\"void\"); printf(\"\\n\");");
             body
+        } else if is_supported_entry_float(return_type).is_some() {
+            let mut body = format!(
+                "{return_type} rf_ret = {entry}({source_args}); printf(\"%.6f\", (double)rf_ret);"
+            );
+            if has_ptr_param {
+                for (i, t) in param_types.iter().enumerate() {
+                    if matches!(t.as_str(), "int *" | "const int *") {
+                        body.push_str(&format!(
+                            " if (values[{i}] != before[{i}]) printf(\" p{i}=%d\", values[{i}]);"
+                        ));
+                    }
+                }
+            }
+            body.push_str(" printf(\"\\n\");");
+            body
         } else {
             let (_, ret_unsigned) = is_supported_entry_int(return_type)
                 .context("unsupported return type in verify_inner")?;
@@ -859,6 +877,7 @@ impl Engine {
             );
             args.extend([
                 "driver.c".into(),
+                "-lm".into(),
                 "-o".into(),
                 original.display().to_string(),
             ]);
@@ -930,7 +949,7 @@ impl Engine {
                 "driver.c".into(),
             ];
             link_args.extend(objects);
-            link_args.extend(["-o".into(), original.display().to_string()]);
+            link_args.extend(["-lm".into(), "-o".into(), original.display().to_string()]);
             let run = process::run("clang", &link_args, &dir, &logs, "compile-source", 30).await?;
             let ok = run.success();
             evidence.commands.push(run);
@@ -1064,6 +1083,8 @@ impl Engine {
                     format!("values[{i}]")
                 } else if t == "_Bool" {
                     format!("u8::from(values[{i}] != 0)")
+                } else if let Some(fty) = is_supported_entry_float(t) {
+                    format!("(values[{i}] as {fty})")
                 } else {
                     let (rty, _) = is_supported_entry_int(t).unwrap();
                     format!("(values[{i}] as {rty})")
@@ -1081,6 +1102,21 @@ impl Engine {
                 }
             }
             body.push_str(" if !rf_printed { print!(\"void\"); } println!();");
+            body
+        } else if is_supported_entry_float(return_type).is_some() {
+            let mut body = format!(
+                "let rf_ret = port::rf_{entry}({rust_args}); print!(\"{{:.6}}\", rf_ret as f64);"
+            );
+            if has_ptr_param {
+                for (i, t) in param_types.iter().enumerate() {
+                    if matches!(t.as_str(), "int *" | "const int *") {
+                        body.push_str(&format!(
+                            " if values[{i}] != before[{i}] {{ print!(\" p{i}={{}}\", values[{i}]); }}"
+                        ));
+                    }
+                }
+            }
+            body.push_str(" println!();");
             body
         } else if has_ptr_param {
             let mut body =
@@ -1423,6 +1459,14 @@ fn supported(job: &Job) -> Result<()> {
     );
     Ok(())
 }
+fn is_supported_entry_float(ty: &str) -> Option<&'static str> {
+    match ty {
+        "float" => Some("f32"),
+        "double" => Some("f64"),
+        _ => None,
+    }
+}
+
 fn is_supported_entry_int(ty: &str) -> Option<(&'static str, bool)> {
     Some(match ty {
         "_Bool" => ("u8", true),
@@ -1464,7 +1508,10 @@ fn source_files(root: &Path) -> Result<Vec<String>> {
         let file_name = entry.path().file_name().and_then(|s| s.to_str());
         let is_root_meta = matches!(file_name, Some("compile_commands.json" | ".config"))
             && entry.path().parent() == Some(root);
-        let is_sub_kbuild = matches!(file_name, Some("Kbuild" | "Kconfig" | "Makefile"));
+        let is_sub_kbuild = matches!(
+            file_name,
+            Some("Kbuild" | "Kconfig" | "Makefile" | "CMakeLists.txt")
+        );
         if !is_c_or_h && !is_root_meta && !is_sub_kbuild {
             continue;
         }

@@ -104,10 +104,33 @@ impl IntKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatKind {
+    F32,
+    F64,
+}
+
+impl FloatKind {
+    fn rust_type(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
+    fn c_type(self) -> &'static str {
+        match self {
+            Self::F32 => "float",
+            Self::F64 => "double",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CType {
     Void,
     Int(IntKind),
+    Float(FloatKind),
     Struct(String),
     Union(String),
     Ptr {
@@ -126,6 +149,7 @@ impl CType {
         match (self, other) {
             (Self::Void, Self::Void) => true,
             (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
             (Self::Struct(a), Self::Struct(b)) => a == b,
             (Self::Union(a), Self::Union(b)) => a == b,
             (Self::Ptr { inner: a, .. }, Self::Ptr { inner: b, .. }) => a.same_shape(b),
@@ -184,7 +208,7 @@ impl CType {
                 } else {
                     format!(" -> {}", ret.rust_type())
                 };
-                Ok(format!("fn({p}){r}"))
+                Ok(format!("extern \"C\" fn({p}){r}"))
             }
             _ => bail!("expected function pointer type"),
         }
@@ -194,6 +218,7 @@ impl CType {
         match self {
             Self::Void => "()".into(),
             Self::Int(kind) => kind.rust_type().into(),
+            Self::Float(kind) => kind.rust_type().into(),
             Self::Struct(name) => format!("RfStruct_{name}"),
             Self::Union(name) => format!("RfUnion_{name}"),
             Self::Ptr { inner, .. } => {
@@ -205,7 +230,9 @@ impl CType {
             }
             Self::Array(elem, len) => format!("[{}; {len}]", elem.rust_type()),
             Self::FnPtr { .. } => {
-                let fnty = self.fn_type_only().unwrap_or_else(|_| "fn()".into());
+                let fnty = self
+                    .fn_type_only()
+                    .unwrap_or_else(|_| "extern \"C\" fn()".into());
                 format!("Option<{fnty}>")
             }
         }
@@ -215,6 +242,7 @@ impl CType {
         match self {
             Self::Void => "void".into(),
             Self::Int(kind) => kind.c_type().into(),
+            Self::Float(kind) => kind.c_type().into(),
             Self::Struct(name) => format!("struct {name}"),
             Self::Union(name) => format!("union {name}"),
             Self::Ptr { inner, inner_const } => {
@@ -243,6 +271,7 @@ impl CType {
     fn zero_expr(&self, structs: &StructFieldsMap) -> Result<String> {
         match self {
             Self::Int(kind) => Ok(format!("0{}", kind.rust_type())),
+            Self::Float(kind) => Ok(format!("0.0{}", kind.rust_type())),
             Self::Ptr { .. } => Ok("core::ptr::null_mut()".into()),
             Self::FnPtr { .. } => Ok("None".into()),
             Self::Array(elem, len) => Ok(format!("[{}; {len}]", elem.zero_expr(structs)?)),
@@ -333,6 +362,8 @@ impl CType {
 
         match base_raw {
             "void" => Ok(Self::Void),
+            "float" => Ok(Self::Float(FloatKind::F32)),
+            "double" => Ok(Self::Float(FloatKind::F64)),
             other => {
                 if let Some(tag) = other.strip_prefix("struct ") {
                     let tag = tag.trim();
@@ -405,31 +436,53 @@ fn parse_int_kind(base: &str) -> Option<IntKind> {
     })
 }
 
+fn is_ptr_inner_qualifier(tok: &str) -> bool {
+    matches!(
+        tok,
+        "const"
+            | "volatile"
+            | "restrict"
+            | "__restrict"
+            | "__restrict__"
+            | "_Nonnull"
+            | "_Nullable"
+            | "_Null_unspecified"
+            | "__nonnull"
+            | "__nullable"
+    )
+}
+
 fn split_fn_ptr(s: &str) -> Option<(&str, &str)> {
     let mut depth = 0usize;
     let bytes = s.as_bytes();
     let mut i = 0;
     while i + 2 < bytes.len() {
-        if depth == 0 && &s[i..i + 3] == "(*)" {
-            let after = s[i + 3..].trim_start();
-            if after.starts_with('(') && after.ends_with(')') {
-                let mut inner_depth = 0usize;
-                let mut matched_end = None;
-                for (off, ch) in after.char_indices() {
-                    match ch {
-                        '(' => inner_depth += 1,
-                        ')' => {
-                            inner_depth -= 1;
-                            if inner_depth == 0 {
-                                matched_end = Some(off);
-                                break;
+        if depth == 0 && s[i..].starts_with("(*") {
+            let inside_start = i + 2;
+            if let Some(rel_close) = s[inside_start..].find(')') {
+                let inside = s[inside_start..inside_start + rel_close].trim();
+                if inside.is_empty() || inside.split_whitespace().all(is_ptr_inner_qualifier) {
+                    let after = s[inside_start + rel_close + 1..].trim_start();
+                    if after.starts_with('(') && after.ends_with(')') {
+                        let mut inner_depth = 0usize;
+                        let mut matched_end = None;
+                        for (off, ch) in after.char_indices() {
+                            match ch {
+                                '(' => inner_depth += 1,
+                                ')' => {
+                                    inner_depth -= 1;
+                                    if inner_depth == 0 {
+                                        matched_end = Some(off);
+                                        break;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        _ => {}
+                        if matched_end == Some(after.len() - 1) {
+                            return Some((s[..i].trim(), &after[1..after.len() - 1]));
+                        }
                     }
-                }
-                if matched_end == Some(after.len() - 1) {
-                    return Some((s[..i].trim(), &after[1..after.len() - 1]));
                 }
             }
         }
@@ -516,11 +569,20 @@ fn split_array_type(s: &str) -> Option<(String, usize, bool)> {
 fn strip_trailing_qualifiers(mut s: &str) -> &str {
     loop {
         let trimmed = s.trim();
-        let next = trimmed
-            .strip_suffix("const")
-            .or_else(|| trimmed.strip_suffix("volatile"))
-            .or_else(|| trimmed.strip_suffix("restrict"))
-            .or_else(|| trimmed.strip_suffix("__restrict"));
+        let next = [
+            "const",
+            "volatile",
+            "restrict",
+            "__restrict",
+            "__restrict__",
+            "_Nonnull",
+            "_Nullable",
+            "_Null_unspecified",
+            "__nonnull",
+            "__nullable",
+        ]
+        .into_iter()
+        .find_map(|q| trimmed.strip_suffix(q));
         if let Some(candidate) = next {
             let c_end = candidate.chars().last();
             if c_end.is_none_or(|c| c.is_whitespace() || c == '*') {
@@ -541,10 +603,19 @@ fn strip_pointee_qualifiers(mut s: &str) -> (&str, bool) {
             s = rest;
             continue;
         }
-        if let Some(rest) = trimmed
-            .strip_prefix("volatile ")
-            .or_else(|| trimmed.strip_prefix("restrict "))
-            .or_else(|| trimmed.strip_prefix("__restrict "))
+        if let Some(rest) = [
+            "volatile ",
+            "restrict ",
+            "__restrict ",
+            "__restrict__ ",
+            "_Nonnull ",
+            "_Nullable ",
+            "_Null_unspecified ",
+            "__nonnull ",
+            "__nullable ",
+        ]
+        .into_iter()
+        .find_map(|q| trimmed.strip_prefix(q))
         {
             s = rest;
             continue;
@@ -554,10 +625,19 @@ fn strip_pointee_qualifiers(mut s: &str) -> (&str, bool) {
             s = rest;
             continue;
         }
-        if let Some(rest) = trimmed
-            .strip_suffix(" volatile")
-            .or_else(|| trimmed.strip_suffix(" restrict"))
-            .or_else(|| trimmed.strip_suffix(" __restrict"))
+        if let Some(rest) = [
+            " volatile",
+            " restrict",
+            " __restrict",
+            " __restrict__",
+            " _Nonnull",
+            " _Nullable",
+            " _Null_unspecified",
+            " __nonnull",
+            " __nullable",
+        ]
+        .into_iter()
+        .find_map(|q| trimmed.strip_suffix(q))
         {
             s = rest;
             continue;
@@ -653,7 +733,7 @@ fn make_external_function(name: &str, param_types: &[CType], ret: &CType) -> Ext
         format!(" -> {}", ret.rust_type())
     };
     let rust = format!(
-        "unsafe extern \"C\" {{\n    fn {name}({}){ret_suffix};\n}}\n#[inline]\npub fn rf_{name}({}){ret_suffix} {{\n    unsafe {{ {name}({}) }}\n}}\n",
+        "unsafe extern \"C\" {{\n    fn {name}({}){ret_suffix};\n}}\n#[inline]\npub extern \"C\" fn rf_{name}({}){ret_suffix} {{\n    unsafe {{ {name}({}) }}\n}}\n",
         params_rust.join(", "),
         params_rust.join(", "),
         args_rust.join(", "),
@@ -1254,12 +1334,12 @@ pub fn translate(
         };
         let rust = if matches!(return_ctype, CType::Void) {
             format!(
-                "pub fn rf_{name}({}) {{\nunsafe {{\n{body_code}\n}}\n}}\n{abi_export}",
+                "pub extern \"C\" fn rf_{name}({}) {{\nunsafe {{\n{body_code}\n}}\n}}\n{abi_export}",
                 signature.join(", ")
             )
         } else {
             format!(
-                "pub fn rf_{name}({}) -> {} {{\nunsafe {{\n{body_code}\npanic!(\"C function reached end without a return\");\n}}\n}}\n{abi_export}",
+                "pub extern \"C\" fn rf_{name}({}) -> {} {{\nunsafe {{\n{body_code}\npanic!(\"C function reached end without a return\");\n}}\n}}\n{abi_export}",
                 signature.join(", "),
                 return_ctype.rust_type()
             )
@@ -1491,6 +1571,7 @@ impl Emitter<'_> {
         let (expr, ty) = self.typed_expression(node)?;
         match ty {
             CType::Int(_) => Ok(format!("(({expr}) != 0)")),
+            CType::Float(_) => Ok(format!("(({expr}) != 0.0)")),
             CType::Ptr { .. } => Ok(format!("(!({expr}).is_null())")),
             CType::FnPtr { .. } => Ok(format!("(({expr}).is_some())")),
             _ => bail!("unsupported condition type"),
@@ -1669,6 +1750,48 @@ impl Emitter<'_> {
                 } else {
                     let val = raw.parse::<u128>()?;
                     format!("{val}{}", ik.rust_type())
+                };
+                Ok((formatted, ty))
+            }
+            "FloatingLiteral" => {
+                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let CType::Float(fk) = ty else {
+                    bail!("non-float floating literal");
+                };
+                let raw = text(node, "value");
+                let formatted = match fk {
+                    FloatKind::F32 => {
+                        let val = raw.parse::<f32>().context("invalid float literal")?;
+                        if val.is_infinite() {
+                            if val.is_sign_positive() {
+                                "f32::INFINITY".to_string()
+                            } else {
+                                "f32::NEG_INFINITY".to_string()
+                            }
+                        } else {
+                            let mut s = format!("{val}");
+                            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                                s.push_str(".0");
+                            }
+                            format!("{s}f32")
+                        }
+                    }
+                    FloatKind::F64 => {
+                        let val = raw.parse::<f64>().context("invalid double literal")?;
+                        if val.is_infinite() {
+                            if val.is_sign_positive() {
+                                "f64::INFINITY".to_string()
+                            } else {
+                                "f64::NEG_INFINITY".to_string()
+                            }
+                        } else {
+                            let mut s = format!("{val}");
+                            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                                s.push_str(".0");
+                            }
+                            format!("{s}f64")
+                        }
+                    }
                 };
                 Ok((formatted, ty))
             }
@@ -1945,6 +2068,78 @@ impl Emitter<'_> {
                         };
                         Ok((format!("u8::from({cond})"), target_ty))
                     }
+                    "IntegralToFloating" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        ensure!(
+                            matches!(inner_ty, CType::Int(_))
+                                && matches!(target_ty, CType::Float(_)),
+                            "IntegralToFloating requires integer source and float target"
+                        );
+                        Ok((
+                            format!("(({expr}) as {})", target_ty.rust_type()),
+                            target_ty,
+                        ))
+                    }
+                    "FloatingToIntegral" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        ensure!(
+                            matches!(inner_ty, CType::Float(_))
+                                && matches!(target_ty, CType::Int(_)),
+                            "FloatingToIntegral requires float source and integer target"
+                        );
+                        if matches!(target_ty, CType::Int(IntKind::Bool)) {
+                            Ok((format!("u8::from(({expr}) != 0.0)"), target_ty))
+                        } else {
+                            Ok((
+                                format!("(({expr}) as {})", target_ty.rust_type()),
+                                target_ty,
+                            ))
+                        }
+                    }
+                    "FloatingCast" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        ensure!(
+                            matches!(inner_ty, CType::Float(_))
+                                && matches!(target_ty, CType::Float(_)),
+                            "FloatingCast requires floating types"
+                        );
+                        Ok((
+                            format!("(({expr}) as {})", target_ty.rust_type()),
+                            target_ty,
+                        ))
+                    }
+                    "FloatingToBoolean" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        ensure!(
+                            matches!(inner_ty, CType::Float(_)),
+                            "FloatingToBoolean requires floating operand"
+                        );
+                        Ok((format!("u8::from(({expr}) != 0.0)"), target_ty))
+                    }
+                    "PointerToIntegral" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        ensure!(
+                            matches!(inner_ty, CType::Ptr { .. })
+                                && matches!(target_ty, CType::Int(_)),
+                            "PointerToIntegral requires pointer source and integer target"
+                        );
+                        Ok((
+                            format!("(({expr}) as usize as {})", target_ty.rust_type()),
+                            target_ty,
+                        ))
+                    }
+                    "IntegralToPointer" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        ensure!(
+                            matches!(inner_ty, CType::Int(_))
+                                && matches!(target_ty, CType::Ptr { .. }),
+                            "IntegralToPointer requires integer source and pointer target"
+                        );
+                        Ok((
+                            format!("(({expr}) as usize as {})", target_ty.rust_type()),
+                            target_ty,
+                        ))
+                    }
                     other => bail!("unsupported castKind {other}"),
                 }
             }
@@ -2007,6 +2202,10 @@ impl Emitter<'_> {
                                 let offset = if op == "++" { "1" } else { "-1" };
                                 format!("(*{ptr_var}).wrapping_offset({offset})")
                             }
+                            CType::Float(fk) => {
+                                let bin = if op == "++" { "+" } else { "-" };
+                                format!("((*{ptr_var}) {bin} 1.0{})", fk.rust_type())
+                            }
                             _ => bail!("unsupported type for {op}"),
                         };
                         if let Some((ik, w)) = bf {
@@ -2025,19 +2224,27 @@ impl Emitter<'_> {
                     }
                     "-" => {
                         let (val, ty) = self.typed_expression(&inner[0])?;
-                        let CType::Int(ik) = ty else {
-                            bail!("unary - requires integer");
-                        };
-                        let expr = if ik.is_signed() {
-                            format!("({val}).checked_neg().expect(\"undefined C negation\")")
-                        } else {
-                            format!("({val}).wrapping_neg()")
-                        };
-                        Ok((expr, ty))
+                        match ty {
+                            CType::Int(ik) => {
+                                let expr = if ik.is_signed() {
+                                    format!(
+                                        "({val}).checked_neg().expect(\"undefined C negation\")"
+                                    )
+                                } else {
+                                    format!("({val}).wrapping_neg()")
+                                };
+                                Ok((expr, ty))
+                            }
+                            CType::Float(_) => Ok((format!("(-({val}))"), ty)),
+                            _ => bail!("unary - requires numeric type"),
+                        }
                     }
                     "+" => {
                         let (val, ty) = self.typed_expression(&inner[0])?;
-                        ensure!(matches!(ty, CType::Int(_)), "unary + requires integer");
+                        ensure!(
+                            matches!(ty, CType::Int(_) | CType::Float(_)),
+                            "unary + requires numeric type"
+                        );
                         Ok((val, ty))
                     }
                     "~" => {
@@ -2086,6 +2293,9 @@ impl Emitter<'_> {
                             (CType::Int(a), CType::Int(b)) if a == b => {
                                 format!("((({left}) {op} ({right})) as i32)")
                             }
+                            (CType::Float(a), CType::Float(b)) if a == b => {
+                                format!("((({left}) {op} ({right})) as i32)")
+                            }
                             (CType::Ptr { .. }, CType::Ptr { .. }) if lty.same_shape(&rty) => {
                                 format!("((({left}) {op} ({right})) as i32)")
                             }
@@ -2114,6 +2324,9 @@ impl Emitter<'_> {
                         match (op, &lty, &rty) {
                             (_, CType::Int(a), CType::Int(b)) if a == b => {
                                 Ok((Self::int_binary_op(op, *a, &left, &right)?, lty))
+                            }
+                            (_, CType::Float(a), CType::Float(b)) if a == b => {
+                                Ok((format!("(({left}) {op} ({right}))"), lty))
                             }
                             ("+", CType::Ptr { inner, .. }, CType::Int(_)) => {
                                 ensure!(
@@ -2163,7 +2376,12 @@ impl Emitter<'_> {
                             {
                                 Ok((Self::int_binary_op(op, a, &left, &right)?, lty))
                             }
-                            _ => bail!("binary {op} requires matching integer operands"),
+                            (CType::Float(a), CType::Float(b))
+                                if a == b && matches!(op, "*" | "/") =>
+                            {
+                                Ok((format!("(({left}) {op} ({right}))"), lty))
+                            }
+                            _ => bail!("binary {op} requires matching numeric operands"),
                         }
                     }
                 }
@@ -2187,6 +2405,17 @@ impl Emitter<'_> {
                             format!("({rhs_var} as {})", lk.rust_type())
                         };
                         Self::int_binary_op(base_op, *lk, &format!("(*{ptr_var})"), &rhs_cast)?
+                    }
+                    (CType::Float(lk), CType::Float(_), "+" | "-" | "*" | "/")
+                    | (CType::Float(lk), CType::Int(_), "+" | "-" | "*" | "/") => {
+                        format!("((*{ptr_var}) {base_op} ({rhs_var} as {}))", lk.rust_type())
+                    }
+                    (CType::Int(lk), CType::Float(rk), "+" | "-" | "*" | "/") => {
+                        format!(
+                            "(((*{ptr_var} as {}) {base_op} {rhs_var}) as {})",
+                            rk.rust_type(),
+                            lk.rust_type()
+                        )
                     }
                     (CType::Ptr { inner, .. }, CType::Int(_), "+") => {
                         ensure!(
@@ -2232,7 +2461,10 @@ impl Emitter<'_> {
                 ensure!(!inner.is_empty(), "invalid function call");
                 let callee = &inner[0];
                 if kind(callee) == "ImplicitCastExpr"
-                    && text(callee, "castKind") == "FunctionToPointerDecay"
+                    && matches!(
+                        text(callee, "castKind"),
+                        "FunctionToPointerDecay" | "BuiltinFnToFnPtr"
+                    )
                     && children(callee).len() == 1
                     && kind(&children(callee)[0]) == "DeclRefExpr"
                     && kind(&children(callee)[0]["referencedDecl"]) == "FunctionDecl"
@@ -2240,6 +2472,13 @@ impl Emitter<'_> {
                     let ref_decl = &children(callee)[0]["referencedDecl"];
                     let name = text(ref_decl, "name");
                     identifier(name)?;
+                    if name.starts_with("__builtin_") {
+                        return self.try_emit_builtin(
+                            name,
+                            &inner[1..],
+                            text(&ref_decl["type"], "qualType"),
+                        );
+                    }
                     let (param_types, ret_type) =
                         parse_fn_signature(text(&ref_decl["type"], "qualType"), self.typedefs)?;
                     ensure!(
@@ -2288,6 +2527,116 @@ impl Emitter<'_> {
                 ))
             }
             other => bail!("unsupported expression {other}"),
+        }
+    }
+
+    fn try_emit_builtin(
+        &mut self,
+        name: &str,
+        arg_nodes: &[Value],
+        qual_type: &str,
+    ) -> Result<(String, CType)> {
+        let (param_types, ret_type) = parse_fn_signature(qual_type, self.typedefs)?;
+        ensure!(
+            arg_nodes.len() == param_types.len(),
+            "builtin {name} argument count mismatch"
+        );
+        if name == "__builtin_object_size" {
+            return Ok((format!("usize::MAX as {}", ret_type.rust_type()), ret_type));
+        }
+        let mut args = Vec::with_capacity(arg_nodes.len());
+        for (node, expected_ty) in arg_nodes.iter().zip(&param_types) {
+            let (expr, ty) = self.typed_expression(node)?;
+            ensure!(
+                ty.same_shape(expected_ty),
+                "builtin {name} argument type mismatch"
+            );
+            args.push(expr);
+        }
+        match name {
+            "__builtin___memcpy_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let s_var = self.fresh_var("rf_src");
+                let n_var = self.fresh_var("rf_len");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {s_var} = {}; let {n_var} = ({}) as usize; if {n_var} > 0 {{ core::ptr::copy_nonoverlapping({s_var} as *const u8, {d_var} as *mut u8, {n_var}); }} {d_var} }}",
+                        args[0], args[1], args[2]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin___memmove_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let s_var = self.fresh_var("rf_src");
+                let n_var = self.fresh_var("rf_len");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {s_var} = {}; let {n_var} = ({}) as usize; if {n_var} > 0 {{ core::ptr::copy({s_var} as *const u8, {d_var} as *mut u8, {n_var}); }} {d_var} }}",
+                        args[0], args[1], args[2]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin___memset_chk" => {
+                let d_var = self.fresh_var("rf_dst");
+                let v_var = self.fresh_var("rf_val");
+                let n_var = self.fresh_var("rf_len");
+                Ok((
+                    format!(
+                        "{{ let {d_var} = {}; let {v_var} = ({}) as u8; let {n_var} = ({}) as usize; if {n_var} > 0 {{ core::ptr::write_bytes({d_var} as *mut u8, {v_var}, {n_var}); }} {d_var} }}",
+                        args[0], args[1], args[2]
+                    ),
+                    ret_type,
+                ))
+            }
+            "__builtin_expect" => Ok((args.into_iter().next().unwrap(), ret_type)),
+            "__builtin_bswap16" | "__builtin_bswap32" | "__builtin_bswap64" => Ok((
+                format!("(({}) as {}).swap_bytes()", args[0], ret_type.rust_type()),
+                ret_type,
+            )),
+            "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll" => Ok((
+                format!(
+                    "((({}) as {}).leading_zeros() as {})",
+                    args[0],
+                    param_types[0].rust_type(),
+                    ret_type.rust_type()
+                ),
+                ret_type,
+            )),
+            "__builtin_ctz" | "__builtin_ctzl" | "__builtin_ctzll" => Ok((
+                format!(
+                    "((({}) as {}).trailing_zeros() as {})",
+                    args[0],
+                    param_types[0].rust_type(),
+                    ret_type.rust_type()
+                ),
+                ret_type,
+            )),
+            "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll" => Ok((
+                format!(
+                    "((({}) as {}).count_ones() as {})",
+                    args[0],
+                    param_types[0].rust_type(),
+                    ret_type.rust_type()
+                ),
+                ret_type,
+            )),
+            "__builtin_fabs" => Ok((
+                format!(
+                    "f64::from_bits((({}) as f64).to_bits() & !(1u64 << 63))",
+                    args[0]
+                ),
+                ret_type,
+            )),
+            "__builtin_fabsf" => Ok((
+                format!(
+                    "f32::from_bits((({}) as f32).to_bits() & !(1u32 << 31))",
+                    args[0]
+                ),
+                ret_type,
+            )),
+            _ => bail!("unsupported builtin {name}"),
         }
     }
 

@@ -1,7 +1,7 @@
 //! Recursive Kbuild and Kconfig (`.config`, `Kbuild`, `Makefile`) build-context collector.
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Debug, Default)]
@@ -133,13 +133,21 @@ fn scan_dir(
             let lhs_expanded = expand_kconfig(lhs.trim(), &ctx.kconfig);
             let rhs_expanded = expand_kconfig(rhs.trim(), &ctx.kconfig);
             match lhs_expanded.as_str() {
-                "ccflags-y" | "ccflags-m" | "EXTRA_CFLAGS" => {
+                "ccflags-y" | "ccflags-m" | "EXTRA_CFLAGS" | "CFLAGS" | "CPPFLAGS" => {
                     let target_flags = if dir_key.is_empty() {
                         &mut ctx.cflags
                     } else {
                         ctx.dir_cflags.entry(dir_key.clone()).or_default()
                     };
                     collect_cflags(&rhs_expanded, &abs_dir, target_flags);
+                }
+                "SUBDIRS" => {
+                    for token in rhs_expanded.split_whitespace() {
+                        let sub = token.trim_end_matches('/');
+                        if is_safe_rel(sub) {
+                            active_subdirs.push(rel_dir.join(sub));
+                        }
+                    }
                 }
                 "obj-y" | "obj-m" => {
                     for token in rhs_expanded.split_whitespace() {
@@ -172,6 +180,17 @@ fn scan_dir(
                 _ => {}
             }
         }
+    }
+
+    let cmake_path = abs_dir.join("CMakeLists.txt");
+    if cmake_path.is_file() {
+        let raw = std::fs::read_to_string(&cmake_path)?;
+        let target_flags = if dir_key.is_empty() {
+            &mut ctx.cflags
+        } else {
+            ctx.dir_cflags.entry(dir_key.clone()).or_default()
+        };
+        collect_cmake(&raw, &abs_dir, rel_dir, target_flags, &mut active_subdirs);
     }
 
     for sub in active_subdirs {
@@ -309,5 +328,78 @@ fn collect_cflags(rhs: &str, base_dir: &Path, out: &mut Vec<String>) {
             out.push(tok.to_owned());
         }
         i += 1;
+    }
+}
+
+fn collect_cmake(
+    raw: &str,
+    abs_dir: &Path,
+    rel_dir: &Path,
+    out: &mut Vec<String>,
+    active_subdirs: &mut Vec<PathBuf>,
+) {
+    let cleaned: String = raw
+        .lines()
+        .map(|l| strip_comment(l).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut rest = cleaned.as_str();
+    while let Some(open) = rest.find('(') {
+        let cmd = rest[..open]
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(')') else {
+            break;
+        };
+        let args_str = &after_open[..close];
+        let tokens: Vec<&str> = args_str
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .map(|t| t.trim_matches('"'))
+            .filter(|t| !t.is_empty())
+            .collect();
+        match cmd.as_str() {
+            "add_definitions" => collect_cflags(args_str, abs_dir, out),
+            "add_compile_definitions" => {
+                for tok in tokens {
+                    if tok.contains('$') {
+                        continue;
+                    }
+                    if tok.starts_with("-D") || tok.starts_with("-U") {
+                        out.push(tok.to_owned());
+                    } else if tok
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                    {
+                        out.push(format!("-D{tok}"));
+                    }
+                }
+            }
+            "include_directories" => {
+                for tok in tokens {
+                    if matches!(tok, "BEFORE" | "AFTER" | "SYSTEM") || tok.contains('$') {
+                        continue;
+                    }
+                    if is_safe_rel(tok) {
+                        out.push("-I".into());
+                        out.push(abs_dir.join(tok).display().to_string());
+                    }
+                }
+            }
+            "add_subdirectory" => {
+                if let Some(&sub) = tokens.first()
+                    && !sub.contains('$')
+                    && is_safe_rel(sub.trim_end_matches('/'))
+                {
+                    active_subdirs.push(rel_dir.join(sub.trim_end_matches('/')));
+                }
+            }
+            _ => {}
+        }
+        rest = &after_open[close + 1..];
     }
 }

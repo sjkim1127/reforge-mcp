@@ -134,7 +134,7 @@ async fn multi_file_port_compiles_matches_and_resumes() {
 #[tokio::test]
 async fn rejects_unsupported_semantics_and_unresolved_calls() {
     let sources = [
-        "double f(double a) { return a+1.0; }",
+        "_Complex double f(_Complex double a) { return a; }",
         "int global=1; int f(int x) { return x+global; }",
         "int f(int x) { int value; return value+x; }",
         "int f(int x) { static int count=1; return x+count; }",
@@ -1218,4 +1218,146 @@ int process_packet(int32_t raw) {
     )
     .unwrap();
     assert_eq!(engine.report(&job.job_id).unwrap().state, "stale");
+}
+
+#[tokio::test]
+async fn floating_point_math_structs_and_compound_assignments_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "geom.c",
+        r#"
+#include <math.h>
+
+struct Vec2D {
+    double x;
+    double y;
+    float weight;
+};
+
+double eval_vec(int n, float scale) {
+    struct Vec2D v = { (double)n + 1.5, 2.0, scale * 0.5f };
+    v.x += n;
+    v.weight++;
+    int bonus = 10;
+    bonus += 2.75;
+    double norm = sqrt(v.x * v.x + v.y * v.y);
+    double mag = fabs((double)v.weight);
+    if (v.weight) {
+        norm += mag + (double)(int)(norm * 0.25) + (double)bonus;
+    }
+    return norm;
+}
+"#,
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "eval_vec",
+            vec![vec![0, 2], vec![3, 4], vec![-5, -6]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn general_purpose_stdlib_heap_string_qsort_and_cmake_context_match() {
+    let workspace = Workspace::new();
+    std::fs::create_dir(workspace.source.join("inc")).unwrap();
+    std::fs::create_dir(workspace.source.join("sub")).unwrap();
+
+    workspace.write(
+        "CMakeLists.txt",
+        "cmake_minimum_required(VERSION 3.16)\nproject(app C)\nadd_compile_definitions(CMAKE_SCALE=2)\ninclude_directories(inc)\nadd_subdirectory(sub)\n",
+    );
+    workspace.write("inc/defs.h", "int sub_adjust(int v);\n");
+    workspace.write("sub/Makefile", "CFLAGS += -DSUB_BIAS=5\n");
+    workspace.write(
+        "sub/helper.c",
+        "#include \"defs.h\"\nint sub_adjust(int v) { return v * CMAKE_SCALE + SUB_BIAS; }\n",
+    );
+    workspace.write(
+        "app.c",
+        r#"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "defs.h"
+
+static int cmp_desc(const void *a, const void *b) {
+    int va = *(const int *)a;
+    int vb = *(const int *)b;
+    return (vb > va) - (vb < va);
+}
+
+int run_userspace_lib(int n, int seed) {
+    int count = n;
+    if (__builtin_expect(count < 4, 0)) count = 4;
+    if (count > 16) count = 16;
+
+    int *buf = (int *)calloc((size_t)count, sizeof(int));
+    if (!buf) return -1;
+    buf = (int *)realloc(buf, (size_t)count * sizeof(int));
+    if (!buf) return -2;
+
+    int *mirror = (int *)malloc((size_t)count * sizeof(int));
+    if (!mirror) {
+        free(buf);
+        return -3;
+    }
+    memset(mirror, 0, (size_t)count * sizeof(int));
+
+    for (int i = 0; i < count; i++) {
+        buf[i] = sub_adjust(seed + i * 3);
+    }
+    memcpy(mirror, buf, (size_t)count * sizeof(int));
+    memmove(mirror + 1, mirror, (size_t)(count - 1) * sizeof(int));
+    qsort(buf, (size_t)count, sizeof(int), cmp_desc);
+
+    char label[8] = {0};
+    memcpy(label, "rf-ok", 6);
+    int slen = (int)strlen(label);
+    int scmp = strcmp(label, "rf-ok") == 0 ? 10 : -10;
+    int mcmp = memcmp(buf, buf, sizeof(int)) == 0 ? 1 : 0;
+
+    uintptr_t paddr = (uintptr_t)buf;
+    int low_bits = (int)(paddr & 0x3u);
+    void *sentinel = (void *)(uintptr_t)0x10;
+    int sentinel_ok = sentinel != NULL ? 1 : 0;
+
+    uint32_t u = (uint32_t)(seed == 0 ? 0x12345678u : (uint32_t)seed);
+    int bits = __builtin_popcount(u) + __builtin_clz(u) + __builtin_ctz(u);
+    uint32_t swapped = __builtin_bswap32(u);
+
+    int total = buf[0] + mirror[1] + slen + scmp + mcmp + low_bits + sentinel_ok + bits + (int)(swapped & 0xffu);
+    free(mirror);
+    free(buf);
+    return total;
+}
+"#,
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert!(job.external_functions.iter().any(|e| e.name == "malloc"));
+    assert!(job.external_functions.iter().any(|e| e.name == "qsort"));
+    assert!(job.external_functions.iter().any(|e| e.name == "free"));
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "run_userspace_lib",
+            vec![vec![2, 0], vec![6, 7], vec![10, -13]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
 }

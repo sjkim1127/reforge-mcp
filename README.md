@@ -26,18 +26,18 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 
 | 기능 | 상태 |
 |---|---|
-| C 분석과 소스 스냅샷 | Clang AST, `compile_commands.json`, 재귀 Kbuild/`.config` 수집, 파일/내용 해시, 헤더·매크로 전처리, 미지원 구문 거부 |
+| C 분석과 소스 스냅샷 | Clang AST, `compile_commands.json`, `CMakeLists.txt`/`Makefile`/재귀 Kbuild/`.config` 수집, 파일/내용 해시, 헤더·매크로 전처리, 미지원 구문 거부 |
 | 포팅 계획과 컨텍스트 | 함수 의존성 순서, 재귀 그룹, 구조체·union·상수·외부 심볼·Kconfig 목록, 원본 범위와 Rust 대응 |
-| Rust 자동 생성 | 부호/무부호·고정폭 정수·enum·`void`·구조체/union·비트필드·배열·포인터·함수 포인터·문자열·`static const`·루프·`switch`·전방 `goto`·`sizeof`·외부 호출, `rf_abi_*` 내보내기 및 커널 `#![no_std]`/`Kbuild`/`rf_port_bindings.h` 어댑터 |
+| Rust 자동 생성 | 부호/무부호·고정폭 정수·`float`/`double`·enum·`void`·구조체/union·비트필드·배열·포인터·함수 포인터(`extern "C"`)·문자열·`static const`·루프·`switch`·전방 `goto`·`sizeof`·`malloc`/libc/builtin 호출, `rf_abi_*` 내보내기 및 커널 `#![no_std]`/`Kbuild`/`rf_port_bindings.h` 어댑터 |
 | AI 후보 제출 | `src/lib.rs`를 새 시도로 저장; 자동 생성 후보와 같은 검증 경로 사용 |
-| 원본/Rust 차등 검증 | C UBSan, offline Cargo 빌드, `#![no_std]` rlib 및 C 바인딩 헤더 검증, 양방향 C↔Rust FFI 경계 링크, 동일 입력의 stdout/stderr/종료 코드 비교 |
+| 원본/Rust 차등 검증 | C UBSan(`-lm` 링크), offline Cargo 빌드, `#![no_std]` rlib 및 C 바인딩 헤더 검증, 양방향 C↔Rust FFI 경계 링크, 동일 입력의 stdout/stderr/종료 코드 비교 |
 | 작업 저장과 재개 | SQLite 작업/이벤트, 생성·검증 이력, 소스/후보 변경 시 검증 만료 |
 | 캠페인 인벤토리 | 파일 해시, 언어/빌드 manifest 발견, 페이지 조회, 소스 컨텍스트 |
 | 의존성 이전 수명주기 | Agent 작성 계약·후보, 어댑터 계획, 하위 캠페인 연결, JSON 실행 차등 검증 |
 | 저장소 검색과 일반 로드맵 | 기존 구현 유지 |
 | C++·Java·Python·Go 포팅, Joern, 모델 기반 자동 수정 | 계획 |
 
-현재 C 지원 범위는 부호/무부호/고정 폭 정수(`int8_t`–`int64_t`, `uint8_t`–`uint64_t`, `u8`–`u64`, `s8`–`s64`, `size_t`, `ptrdiff_t`, `bool`), `enum`, `void`, 구조체/공용체(`struct`, `union`, `typedef`), 비트필드, 고정 크기 배열, 포인터(`int *`, `const int *`, `struct *`, `union *`, 중첩 포인터), 함수 포인터(`Option<fn>`), 문자열 리터럴, 파일 스코프 `static const` 상수·테이블, `sizeof`/`alignof`를 사용하는 C 라이브러리 함수입니다. 부호 있는 checked / 무부호 wrapping 산술·시프트(`<<`, `>>`)·비교·논리·비트 연산, 복합 대입(`+=`, `-=` 등), 전/후위 `++`/`--`, 분기, `switch`/`case`/`default`(fallthrough 포함), 루프(`for`, `while`, `do-while`, `break`, `continue`), 전방 `goto` 에러 정리 레이블, 초기화된 지역 변수, 직접·간접 호출, 외부 C 프로토타입(`unsafe extern "C"`), C FFI 경계 파일(`ffi/`, `external/`, `*.ffi.c`, `*.external.c`) 및 양방향 `rf_abi_*` C ABI 내보내기를 지원하며, 자동 생성 시 `kbuild/rf_kernel_port.rs`(`#![no_std]`), `kbuild/Kbuild`, `kbuild/rf_port_bindings.h` 어댑터 출력을 함께 생성·검증합니다. `.config`, 재귀 서브디렉터리 `Kbuild`/`Makefile`의 `CONFIG_*`·`ccflags-y`·`obj-y`/`obj-n` 필터링과 `compile_commands.json`, include guard, 매크로, 조건부 컴파일, 헤더의 구조체·union·enum·상수·함수 선언과 공유 inline 함수도 지원합니다. 가변 전역 상태, `static` 지역 변수, 미초기화 지역 변수, 역방향/교차 스코프 `goto`, 인라인 어셈블리, 가변 인자, `main`은 거부합니다. 프로젝트 한도는 4,096파일, 총 64 MiB입니다. 시스템 헤더의 선언은 원본 함수로 잘못 변환하지 않으며, 프로젝트/외부 include 파일과 `.config`/`Kbuild`의 해시를 기록해 변경 시 검증을 만료시킵니다.
+현재 C 지원 범위는 커널 C뿐 아니라 범용 사용자 공간 C 라이브러리까지 포함합니다. 부호/무부호/고정 폭 정수(`int8_t`–`int64_t`, `uint8_t`–`uint64_t`, `u8`–`u64`, `s8`–`s64`, `size_t`, `ptrdiff_t`, `intptr_t`/`uintptr_t`, `bool`), 부동소수점(`float`, `double`), `enum`, `void`, 구조체/공용체(`struct`, `union`, `typedef`), 비트필드, 고정 크기 배열, 포인터(`int *`, `const int *`, `struct *`, `union *`, `void *`, 포인터↔정수 캐스트), C ABI 함수 포인터(`Option<extern "C" fn>`), 문자열 리터럴, 파일 스코프 `static const` 상수·테이블, `sizeof`/`alignof`를 사용하는 C 함수를 지원합니다. 부호 있는 checked / 무부호 wrapping 산술·부동소수점 사칙/비교/변환·시프트(`<<`, `>>`)·논리·비트 연산, 복합 대입(`+=`, `-=`, `*=` 등), 전/후위 `++`/`--`, 분기, `switch`/`case`/`default`(fallthrough 포함), 루프(`for`, `while`, `do-while`, `break`, `continue`), 전방 `goto` 에러 정리 레이블, 초기화된 지역 변수, 직접·간접 호출, 표준 C 동적 힙/문자열/수학/builtin(`malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `strlen`, `strcmp`, `qsort`, `<math.h>`, `__builtin_bswap*`/`clz`/`ctz`/`popcount`/`expect`/`fabs*`), 외부 C 프로토타입(`unsafe extern "C"`), C FFI 경계 파일(`ffi/`, `external/`, `*.ffi.c`, `*.external.c`) 및 양방향 `rf_abi_*` C ABI 내보내기를 지원하며, 자동 생성 시 `kbuild/rf_kernel_port.rs`(`#![no_std]`), `kbuild/Kbuild`, `kbuild/rf_port_bindings.h` 어댑터 출력을 함께 생성·검증합니다. `CMakeLists.txt`(`add_compile_definitions`, `add_definitions`, `include_directories`, `add_subdirectory`), 일반 `Makefile`(`CFLAGS`, `CPPFLAGS`, `SUBDIRS`), `.config`·재귀 `Kbuild`·`compile_commands.json`, include guard, 매크로, 조건부 컴파일, 헤더의 구조체·union·enum·상수·함수 선언과 공유 inline 함수도 지원합니다. 가변 전역 상태, `static` 지역 변수, 미초기화 지역 변수, 역방향/교차 스코프 `goto`, 인라인 어셈블리, 가변 인자, `main`, `_Complex`는 거부합니다. 프로젝트 한도는 4,096파일, 총 64 MiB입니다. 시스템 헤더의 선언은 원본 함수로 잘못 변환하지 않으며, 프로젝트/외부 include 파일과 `.config`/`Kbuild`/`CMakeLists.txt`의 해시를 기록해 변경 시 검증을 만료시킵니다.
 
 `completed`는 **선택한 진입 함수와 제공한 fixture가 최신 소스/후보에서 일치했다**는 뜻입니다. 전체 프로그램 동등성이나 모든 입력에 대한 보장은 아닙니다. C 원본의 UB, 빌드 실패, 타임아웃은 검증 성공으로 처리하지 않습니다.
 

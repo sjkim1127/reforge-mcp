@@ -80,7 +80,7 @@ CPG와 분리된 제품 모델을 두어 분석 백엔드를 교체할 수 있�
 
 | 언어 | 초기 범위 | 확장 전 차단/명시 항목 |
 |---|---|---|
-| C | 고정폭/무부호/bool 정수, `enum`, `void`, `struct`/`union`, 비트필드, 배열, 포인터/함수 포인터, 문자열/`static const`, `switch`/전방 `goto`/루프, `sizeof`, 외부 C/양방향 ABI, `compile_commands.json`/재귀 Kbuild | 가변 전역 상태, 동적/미해결 호출, 역방향 `goto`, 인라인 asm, 가변 인자, 커널 동시성/MMIO |
+| C | 고정폭/무부호/bool 정수, `float`/`double`, `enum`, `void`, `struct`/`union`, 비트필드, 배열, 포인터·정수 캐스트/C ABI 함수 포인터, 문자열/`static const`, `switch`/전방 `goto`/루프, `sizeof`, `malloc`/libc/builtin, 외부 C/양방향 ABI, `compile_commands.json`/`CMakeLists.txt`/`Makefile`/재귀 Kbuild | 가변 전역 상태, 동적/미해결 호출, 역방향 `goto`, 인라인 asm, 가변 인자, `_Complex`, 커널 동시성/MMIO |
 | C++ | 값 타입, 제한된 클래스/컨테이너 | 템플릿, 상속/가상 호출, RAII, 예외, ABI |
 | Java | 정적 타입의 로직과 제한된 클래스 | reflection, 프레임워크, GC 별칭, 예외, JVM 라이브러리 |
 | Python | 타입 계약이 있는 순수 함수와 작은 CLI | 동적 타입/속성, 큰 정수 의미, monkey patch, C 확장 |
