@@ -54,9 +54,9 @@ Linux의 공식 설계는 `no_std`, C bindings와 안전한 abstractions, Kconfi
 
 ## 다음 구현의 우선순위와 인수 기준
 
-1. **실제 빌드 컨텍스트 수집**: compilation database와 Kbuild 산출물에서 argv/cwd/소스/타깃/설정/생성 헤더를 수집한다. 설정이 다른 동일 파일은 별도 단위다. GNU C 옵션을 기존 `-std=c11` 고정값으로 덮어쓰지 않는다. 선택한 커널 커밋/설정에서 얻은 실제 translation unit을 동일 컨텍스트로 분석하고, 미지원 옵션은 보고한다.
+1. **실제 빌드 컨텍스트 수집(재귀 Kbuild 확장)**: `compile_commands.json`과 `.config`, 재귀 서브디렉터리 `Kbuild`/`Makefile` (`CONFIG_*`, `obj-y`/`obj-m`/`obj-n`, 디렉터리별 `ccflags-y`/`EXTRA_CFLAGS`) 수집을 구현했으며, 후속으로 생성 헤더(`generated/`)와 전체 커널 빌드 argv/cwd/타깃 수집으로 확장한다. 설정이 다른 동일 파일은 별도 단위다. `compile_commands.json`이나 `Kbuild`에 `-std=`가 없는 경우에만 기본 `-std=c11`을 적용한다. 선택한 커널 커밋/설정에서 얻은 실제 translation unit을 동일 컨텍스트로 분석하고, 미지원 옵션은 보고한다.
 2. **포팅 모델 분리**: 현재 `Function.rust`에 결합된 분석과 생성 구조를 typed IR 및 생성 백엔드로 분리한다. structs/enums/unions, 정수 폭/부호, 포인터, 배열, 함수 포인터, 메모리 효과와 출처를 표현한다. 표현하지 못하는 의미를 생성 단계에서 임의로 메우지 않는다.
-3. **혼합 빌드와 ABI**: standalone Cargo와 별개로 커널 Kbuild 출력 어댑터를 만든다. 작은 실제 단위의 C 호출자와 Rust 구현을 함께 빌드하고 타입 배치/심볼 계약을 확인한다. bindings 생성과 원본 함수 구현 이전을 별도 결과로 기록한다.
+3. **혼합 빌드와 ABI**: standalone Cargo 외에 `generate` 단계에서 `#![no_std]` 커널 Rust 모듈(`kbuild/rf_kernel_port.rs`), Linux `kbuild/Kbuild`, C 바인딩 헤더(`kbuild/rf_port_bindings.h`)를 출력하고 검증(`compile-kernel-nostd`, `check-kernel-bindings-header`)하는 Kbuild 어댑터를 구현했다. 후속으로 실제 커널 트리 내 out-of-tree/in-tree 모듈 링크와 타입 배치/심볼 계약을 확장한다. bindings 생성과 원본 함수 구현 이전을 별도 결과로 기록한다.
 4. **커널 실행 worker**: 소스/설정/툴체인/커널/루트 파일시스템을 고정한 Linux worker에서 대상 커널을 빌드·부팅·시험한다. 현재 macOS 호스트의 함수 테스트를 커널 실행 검사로 대체하지 않는다. `rustavailable`로 선택한 커널/툴체인의 Rust 빌드 조건을 확인한다. [Kernel Rust quick start](https://docs.kernel.org/rust/quick-start.html)
 5. **자동 이전/수정 반복**: 서브시스템 단위 작업 그래프, 생성/검증/수정, checkpoint, 예산과 설정별 재개를 연결한다. 의존 단위의 변경은 관련 설정과 검증 근거를 무효화한다. 이후 실제 드라이버/서브시스템 corpus와 아키텍처/설정 행렬을 확장한다.
 

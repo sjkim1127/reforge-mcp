@@ -13,14 +13,52 @@ pub struct HeaderDependency {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructField {
+    pub name: String,
+    pub c_type: String,
+    pub rust_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructDef {
+    pub name: String,
+    pub rust_name: String,
+    pub fields: Vec<StructField>,
+    pub source_file: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub rust: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFunction {
+    pub name: String,
+    pub parameter_types: Vec<String>,
+    pub return_type: String,
+    pub rust: String,
+}
+
+fn default_int_type() -> String {
+    "int".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
     pub parameters: Vec<String>,
+    #[serde(default)]
+    pub parameter_types: Vec<String>,
+    #[serde(default = "default_int_type")]
+    pub return_type: String,
     pub source_file: String,
     pub line_start: usize,
     pub line_end: usize,
     pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub external_dependencies: Vec<String>,
+    #[serde(default)]
+    pub is_static: bool,
     pub rust: String,
 }
 
@@ -96,7 +134,25 @@ pub struct Job {
     pub source_files: Vec<SourceFile>,
     #[serde(default)]
     pub header_dependencies: Vec<HeaderDependency>,
+    #[serde(default)]
+    pub structs: Vec<StructDef>,
+    #[serde(default)]
+    pub constants: Vec<String>,
     pub functions: Vec<Function>,
+    #[serde(default)]
+    pub external_functions: Vec<ExternalFunction>,
+    #[serde(default)]
+    pub c_boundary_files: Vec<String>,
+    #[serde(default)]
+    pub compilation_database: bool,
+    #[serde(default)]
+    pub kconfig: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub inactive_source_files: Vec<String>,
+    #[serde(default)]
+    pub kernel_profile: Option<String>,
+    #[serde(default)]
+    pub kbuild_artifacts: Vec<SourceFile>,
     pub unsupported: Vec<Diagnostic>,
     pub analysis_commands: Vec<CommandRun>,
     pub analysis_complete: bool,

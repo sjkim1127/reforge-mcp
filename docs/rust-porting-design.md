@@ -80,7 +80,7 @@ CPG와 분리된 제품 모델을 두어 분석 백엔드를 교체할 수 있�
 
 | 언어 | 초기 범위 | 확장 전 차단/명시 항목 |
 |---|---|---|
-| C | 고정 폭 정수, 분기/루프, 명시적 배열 길이의 함수 | 포인터 별칭/소유권, UB, 전처리/ABI, 함수 포인터 |
+| C | 고정폭/무부호/bool 정수, `enum`, `void`, `struct`/`union`, 비트필드, 배열, 포인터/함수 포인터, 문자열/`static const`, `switch`/전방 `goto`/루프, `sizeof`, 외부 C/양방향 ABI, `compile_commands.json`/재귀 Kbuild | 가변 전역 상태, 동적/미해결 호출, 역방향 `goto`, 인라인 asm, 가변 인자, 커널 동시성/MMIO |
 | C++ | 값 타입, 제한된 클래스/컨테이너 | 템플릿, 상속/가상 호출, RAII, 예외, ABI |
 | Java | 정적 타입의 로직과 제한된 클래스 | reflection, 프레임워크, GC 별칭, 예외, JVM 라이브러리 |
 | Python | 타입 계약이 있는 순수 함수와 작은 CLI | 동적 타입/속성, 큰 정수 의미, monkey patch, C 확장 |
@@ -107,11 +107,11 @@ CPG와 분리된 제품 모델을 두어 분석 백엔드를 교체할 수 있�
 
 현재 상태는 `analyzing → analyzed → planned → generated → verifying → completed`이며 `blocked`, `failed`, 조회 시 `stale`/`interrupted`를 보고한다. 보고서의 이전 성공 기록은 역사적 근거이며 현재 상태가 `completed`가 아니면 최신 후보의 완료로 사용할 수 없다. 원본 및 스냅샷의 파일 해시, 후보 manifest/라이브러리 해시를 검증 전후와 보고서 조회 시 확인한다. 후보 재제출은 이전 시도를 덮어쓰지 않는다.
 
-검증은 명시된 단일 진입 함수의 int32 fixture를 대상으로 한다. C 원본은 UBSan 및 recovery 비활성화로 컴파일하고, Rust는 고정 manifest의 dependency-free Cargo 프로젝트를 offline 빌드한 뒤 동일 후보를 호출하는 rustc 드라이버를 실행한다. 빌드/실행 argv, cwd, 버전, 종료 결과, 로그 경로, 입력과 후보/스냅샷 해시가 결과에 포함된다. 산술 UB와 원본 실패는 `blocked`, 후보 컴파일 오류/타임아웃/동작 차이는 `failed`다.
+검증은 명시된 단일 진입 함수(정수형/`int *`/`const int *` 인자, 정수형/`void` 반환)의 fixture를 대상으로 한다. C 원본은 UBSan 및 recovery 비활성화로 컴파일하고, Rust는 고정 manifest의 dependency-free Cargo 프로젝트를 offline 빌드하며(자동 생성 `kbuild/` 아티팩트가 있을 경우 `kbuild/rf_kernel_port.rs` `#![no_std]` rlib 빌드 및 `kbuild/rf_port_bindings.h` C11 구문 검사 포함), 동일 후보(필요 시 프로젝트 내 C FFI 경계 오브젝트 포함)를 호출하는 rustc 드라이버를 실행한다. 빌드/실행 argv, cwd, 버전, 종료 결과, 로그 경로, 입력과 후보/스냅샷 해시가 결과에 포함된다. 산술 UB와 원본 실패는 `blocked`, 후보 컴파일 오류/타임아웃/동작 차이는 `failed`다.
 
-현재 구현은 Clang의 Makefile dependency 파일을 읽어 프로젝트/시스템 헤더의 경로와 해시를 기록한다. 새 작업의 schema version은 2이며 소스 스냅샷 해시에 외부 include dependency도 포함한다. 기존 v1 작업은 계속 조회할 수 있다. 헤더에 있는 공유 inline 함수는 원본 파일/범위와 생성 내용을 기준으로 중복 제거하고, 외부 헤더의 함수 선언은 생성 대상에서 제외한다. 분석과 원본 빌드에 `-fno-builtin`을 적용해 builtin 이름의 실제 원본 함수를 검사한다.
+현재 구현은 Clang의 Makefile dependency 파일과 `compile_commands.json`, `.config`, 재귀 서브디렉터리 `Kbuild`/`Makefile`을 읽어 프로젝트/시스템 헤더의 경로·해시 및 파일별·디렉터리별 컴파일 플래그·활성 번역 단위를 기록한다. 새 작업의 schema version은 2이며 소스 스냅샷 해시에 외부 include dependency도 포함한다. 기존 v1 작업은 계속 조회할 수 있다. 헤더에 있는 공유 inline 함수와 구조체·union·enum·`static const` 정의는 원본 파일/범위와 생성 내용을 기준으로 중복 제거하고, 외부 헤더의 함수 선언은 생성 대상에서 제외한다(호출되는 외부 프로토타입은 `extern "C"` 경계로 기록하며, 비정적 포팅 함수는 `rf_abi_*`로 C ABI에 노출한다). 분석과 원본 빌드에 `-fno-builtin`을 적용해 builtin 이름의 실제 원본 함수를 검사한다.
 
-현재 fixture 검증은 stdout/stderr/종료 코드를 비교한다. 파일 부작용·네트워크·전체 CLI 이전·OS 격리·모델 기반 수정 반복은 아직 구현되지 않았다. 포인터·전역·외부 함수 호출·루프·main을 차단하므로 생성기가 다루는 내부 C 함수는 로컬 값 연산에 한정된다. 에이전트 제출 Rust는 로컬 호스트에서 실행되므로 실행 시간/출력 제한을 OS 보안 격리로 취급하지 않는다.
+현재 fixture 검증은 stdout/stderr/종료 코드 및 진입 함수 포인터 인자의 변경값을 비교한다. 파일 부작용·네트워크·전체 CLI 이전·OS 격리·모델 기반 수정 반복은 아직 구현되지 않았다. 가변 전역 변수·`static` 지역 변수·미초기화 변수·역방향 `goto`·인라인 어셈블리·`main`은 차단하며, 포인터 역참여는 런타임 null 검사(`rf_ptr`)를 적용한다. 에이전트 제출 Rust는 로컬 호스트에서 실행되므로 실행 시간/출력 제한을 OS 보안 격리로 취급하지 않는다.
 
 ## 기존 코드와 이름 전환
 

@@ -121,7 +121,7 @@ def main():
         assert any(item["job_id"] == job_id for item in resumed.tool("list_porting_jobs", {})["jobs"])
         output = data / "report.json"
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps({"job_id": job_id, "state": report["state"], "matched_cases": len(cases), "restart_resume": True, "unsupported_pointer": "blocked",
+        print(json.dumps({"job_id": job_id, "state": report["state"], "matched_cases": len(cases), "restart_resume": True, "unsupported_global": "blocked",
                     "header_cases": 6,
                     "musl_abs_cases": 6,
                     "musl_abs_int_min": "blocked", "report": str(output)}, ensure_ascii=False))

@@ -132,15 +132,15 @@ async fn multi_file_port_compiles_matches_and_resumes() {
 }
 
 #[tokio::test]
-async fn rejects_unsupported_semantics_and_external_calls() {
+async fn rejects_unsupported_semantics_and_unresolved_calls() {
     let sources = [
-        "int f(int *p) { return *p; }",
-        "unsigned f(unsigned a) { return a+1; }",
+        "double f(double a) { return a+1.0; }",
         "int global=1; int f(int x) { return x+global; }",
-        "int f(int x) { while(x>0) x=x-1; return x; }",
-        "int external(int); int f(int x) { return external(x); }",
         "int f(int x) { int value; return value+x; }",
         "int f(int x) { static int count=1; return x+count; }",
+        "int f(int x) { loop_top: if (x > 0) { x--; goto loop_top; } return x; }",
+        "int f(int x) { __asm__(\"nop\"); return x; }",
+        "int vfn(int x, ...); int f(int x) { return vfn(x, 1); }",
     ];
     for source in sources {
         let workspace = Workspace::new();
@@ -575,4 +575,647 @@ async fn escaped_header_paths_and_missing_final_newline_preserve_source_bytes() 
         .await
         .unwrap();
     assert_eq!(result.state, "completed", "{}", describe(&result));
+}
+
+#[tokio::test]
+async fn loops_for_while_do_break_continue_and_compound_assignments_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "loops.c",
+        r#"
+int sum_loops(int n, int limit) {
+    int acc = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == 2) continue;
+        if (i >= limit) break;
+        acc += (i << 1) + 1;
+    }
+    int w = n;
+    while (w > 0) {
+        w -= 2;
+        if (w == 1) continue;
+        acc ^= (w & 7);
+    }
+    int d = 0;
+    do {
+        d++;
+        if (d == 2) continue;
+        acc += d;
+    } while (d < 4);
+    int z = 16;
+    z >>= 2;
+    return acc + z;
+}
+"#,
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "sum_loops",
+            vec![vec![0, 5], vec![1, 5], vec![6, 4], vec![8, 10]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn structs_nested_fields_and_pointer_mutations_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "types.h",
+        r#"
+struct Inner {
+    int x;
+    int y;
+};
+typedef struct {
+    struct Inner pos;
+    int weight;
+} Item;
+"#,
+    );
+    workspace.write(
+        "ops.c",
+        r#"
+#include "types.h"
+
+void bump_pair(int *a, int *b) {
+    int tmp = *a;
+    *a = *b + 1;
+    *b = tmp + 2;
+}
+
+void scale_item(Item *item, const int *factor) {
+    if (!item || !factor) return;
+    item->pos.x *= *factor;
+    item->pos.y += item->weight;
+}
+
+int evaluate_item(int *io_val, int factor) {
+    Item it = { .pos = { *io_val, 3 }, .weight = 5 };
+    Item zeroed = { 0 };
+    int other = zeroed.weight + 4;
+    bump_pair(io_val, &other);
+    scale_item(&it, &factor);
+    int *p = &it.pos.x;
+    int *q = &it.pos.y;
+    p[0] += *q + other;
+    return p[0] + (int)(p - p);
+}
+"#,
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert_eq!(job.structs.len(), 2);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "evaluate_item",
+            vec![vec![2, 3], vec![-4, 5], vec![10, 0]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+    assert!(
+        verified.verifications[0].cases[0]
+            .source
+            .stdout
+            .contains("p0=5")
+    );
+    let void_verified = engine
+        .verify(&job.job_id, "bump_pair", vec![vec![3, 7], vec![0, -1]])
+        .await
+        .unwrap();
+    assert_eq!(
+        void_verified.state,
+        "completed",
+        "{}",
+        describe(&void_verified)
+    );
+    assert_eq!(
+        void_verified.verifications.last().unwrap().cases[0]
+            .source
+            .stdout
+            .trim(),
+        "p0=8 p1=5"
+    );
+}
+
+#[tokio::test]
+async fn external_function_calls_and_c_boundary_files_compile_and_match() {
+    let workspace = Workspace::new();
+    std::fs::create_dir(workspace.source.join("ffi")).unwrap();
+    workspace.write(
+        "ffi/provider.c",
+        r#"
+static int hidden_bias = 10;
+int c_boundary_compute(int x, int *out) {
+    *out = x * 3 + hidden_bias;
+    return *out + 1;
+}
+"#,
+    );
+    workspace.write(
+        "caller.c",
+        r#"
+#include <stdlib.h>
+int c_boundary_compute(int x, int *out);
+int run_with_external(int x) {
+    int out = 0;
+    int res = c_boundary_compute(abs(x), &out);
+    return res + out;
+}
+"#,
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert_eq!(job.c_boundary_files, vec!["ffi/provider.c"]);
+    assert!(
+        job.external_functions
+            .iter()
+            .any(|e| e.name == "c_boundary_compute")
+    );
+    assert!(job.external_functions.iter().any(|e| e.name == "abs"));
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "run_with_external",
+            vec![vec![-5], vec![0], vec![4]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn large_multi_file_project_and_compile_commands_database_work() {
+    let workspace = Workspace::new();
+    let mut entries = Vec::new();
+    let mut header = String::new();
+    let mut main_body =
+        String::from("#include \"units.h\"\nint sum_40(int x) {\n    int total = x;\n");
+    for i in 0..40 {
+        let fname = format!("unit_{i}.c");
+        header.push_str(&format!("int unit_{i}(int x);\n"));
+        workspace.write(
+            &fname,
+            &format!("int unit_{i}(int x) {{ return x + UNIT_BIAS + {i}; }}\n"),
+        );
+        main_body.push_str(&format!("    total += unit_{i}(x);\n"));
+        entries.push(serde_json::json!({
+            "directory": workspace.source.display().to_string(),
+            "file": workspace.source.join(&fname).display().to_string(),
+            "arguments": ["clang", "-std=c11", "-DUNIT_BIAS=3", "-c", &fname]
+        }));
+    }
+    main_body.push_str("    return total;\n}\n");
+    workspace.write("units.h", &header);
+    workspace.write("driver_lib.c", &main_body);
+    entries.push(serde_json::json!({
+        "directory": workspace.source.display().to_string(),
+        "file": "driver_lib.c",
+        "arguments": ["clang", "-std=c11", "-c", "driver_lib.c"]
+    }));
+    workspace.write(
+        "compile_commands.json",
+        &serde_json::to_string_pretty(&entries).unwrap(),
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert!(job.compilation_database);
+    assert_eq!(job.functions.len(), 41);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(&job.job_id, "sum_40", vec![vec![0], vec![2], vec![-5]])
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn fixed_width_unsigned_enums_and_switch_fallthrough_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "types_switch.c",
+        r#"
+#include <stdint.h>
+#include <stdbool.h>
+
+enum Mode {
+    MODE_ADD = 1,
+    MODE_FALLTHROUGH = 2,
+    MODE_MASK = 3
+};
+
+static uint32_t mix_u32(uint32_t a, uint8_t b, bool flag) {
+    uint64_t wide = (uint64_t)a + (uint64_t)b;
+    if (flag) {
+        wide += 0xffffffffu;
+    }
+    return (uint32_t)(wide ^ (wide >> 4));
+}
+
+int eval_modes(unsigned int raw, int steps) {
+    int64_t acc = 0;
+    for (int i = 0; i < steps; i++) {
+        enum Mode m = MODE_ADD;
+        if ((i & 3) == 1) m = MODE_FALLTHROUGH;
+        else if ((i & 3) == 2) m = MODE_MASK;
+        switch (m) {
+            case MODE_ADD:
+                acc += (int64_t)mix_u32(raw + (uint32_t)i, (uint8_t)(i & 255), i == 0);
+                break;
+            case MODE_FALLTHROUGH:
+                acc += 10;
+                /* intentional fallthrough */
+            case MODE_MASK:
+                acc ^= 0x55;
+                if (i == 2) continue;
+                acc += 1;
+                break;
+            default:
+                break;
+        }
+    }
+    return (int)(acc & 0x7fffffff);
+}
+"#,
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "eval_modes",
+            vec![vec![0, 0], vec![7, 5], vec![-1, 8], vec![123456, 4]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn arrays_sizeof_and_function_pointer_ops_tables_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "ops_arrays.c",
+        r#"
+#include <stddef.h>
+#include <stdint.h>
+
+typedef int (*bin_op_t)(int, int);
+
+struct Ops {
+    bin_op_t apply;
+    int weights[4];
+};
+
+int op_add(int a, int b) { return a + b; }
+int op_sub(int a, int b) { return a - b; }
+
+static int dot_slice(const int *p, int count) {
+    int sum = 0;
+    for (int i = 0; i < count; i++) {
+        sum += p[i] * (i + 1);
+    }
+    return sum;
+}
+
+int run_dispatch(int x, int use_sub) {
+    int local[4] = { 10, 20 };
+    local[2] = x;
+    local[3] = (int)sizeof(local) + (int)sizeof(struct Ops);
+
+    struct Ops ops = { op_add, { 1, 2, 3, 4 } };
+    if (use_sub) {
+        ops.apply = op_sub;
+    }
+    bin_op_t null_fn = NULL;
+    int bonus = (null_fn == NULL && ops.apply != NULL) ? 5 : 0;
+    if (null_fn) {
+        bonus = -999;
+    }
+
+    int d1 = dot_slice(local, 4);
+    int d2 = dot_slice(ops.weights, 4);
+    return ops.apply(d1, d2) + bonus;
+}
+"#,
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "run_dispatch",
+            vec![vec![0, 0], vec![7, 0], vec![-3, 1], vec![42, 1]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn kbuild_and_kconfig_filter_units_and_define_config_macros() {
+    let workspace = Workspace::new();
+    workspace.write(
+        ".config",
+        "CONFIG_FAST_PATH=y\n# CONFIG_LEGACY_BUG is not set\nCONFIG_SCALE=4\n",
+    );
+    workspace.write(
+        "Kbuild",
+        "ccflags-y += -DEXTRA_OFFSET=7\nobj-y += core.o\nobj-$(CONFIG_FAST_PATH) += fast.o\nobj-$(CONFIG_LEGACY_BUG) += broken_legacy.o\n",
+    );
+    workspace.write("fast.h", "int fast_calc(int x);\n");
+    workspace.write(
+        "fast.c",
+        r#"
+#include "fast.h"
+int fast_calc(int x) {
+#ifdef CONFIG_FAST_PATH
+    return x * CONFIG_SCALE + EXTRA_OFFSET;
+#else
+    return 0;
+#endif
+}
+"#,
+    );
+    workspace.write(
+        "core.c",
+        r#"
+#include "fast.h"
+int entry_kbuild(int x) {
+    return fast_calc(x) + 1;
+}
+"#,
+    );
+    // Intentionally invalid C that must be skipped because CONFIG_LEGACY_BUG is not set.
+    workspace.write(
+        "broken_legacy.c",
+        "int global_bad = 1; int broken_fn(int x) { return x + global_bad; }\n",
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert_eq!(job.inactive_source_files, vec!["broken_legacy.c"]);
+    assert_eq!(
+        job.kconfig.get("CONFIG_FAST_PATH").map(String::as_str),
+        Some("y")
+    );
+    assert_eq!(
+        job.kconfig.get("CONFIG_LEGACY_BUG").map(String::as_str),
+        Some("n")
+    );
+    assert_eq!(
+        job.kconfig.get("CONFIG_SCALE").map(String::as_str),
+        Some("4")
+    );
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "entry_kbuild",
+            vec![vec![0], vec![3], vec![-2]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+
+    // Changing .config must invalidate the verified job.
+    workspace.write(
+        ".config",
+        "CONFIG_FAST_PATH=y\n# CONFIG_LEGACY_BUG is not set\nCONFIG_SCALE=5\n",
+    );
+    assert_eq!(engine.report(&job.job_id).unwrap().state, "stale");
+}
+
+#[tokio::test]
+async fn unions_bitfields_static_const_strings_and_forward_goto_cleanup_match() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "lowlevel.c",
+        r#"
+#include <stdint.h>
+
+typedef union {
+    int32_t s;
+    uint32_t u;
+} Word;
+
+struct Flags {
+    unsigned int mode : 3;
+    int delta : 4;
+};
+
+static const int K_LUT[4] = { 3, 7, 11, 19 };
+static const int K_BIAS = 5;
+
+static int tag_score(const char *tag) {
+    return (int)tag[0] + (int)tag[1];
+}
+
+int eval_lowlevel(int x, int step) {
+    Word w = { x };
+    struct Flags fl = { (unsigned int)x, step };
+    fl.mode += 1;
+    fl.delta -= 2;
+    int acc = (int)(w.u & 0xffu) + (int)fl.mode + fl.delta + K_LUT[fl.mode & 3] + K_BIAS;
+    if (x < 0) {
+        acc += tag_score("NG");
+        goto err_stage2;
+    }
+    int bonus = x * 2;
+    if (step > 5) {
+        acc += bonus + tag_score("HI");
+        goto err_stage1;
+    }
+    return acc + bonus + tag_score("OK");
+err_stage1:
+    acc += 100;
+err_stage2:
+    return acc - 10;
+}
+"#,
+    );
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert!(!job.constants.is_empty());
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "eval_lowlevel",
+            vec![
+                vec![0, 0],
+                vec![9, 3],
+                vec![4, 8],
+                vec![-3, -4],
+                vec![15, 7],
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn recursive_subdir_kbuild_and_bidirectional_c_rust_abi_calls_match() {
+    let workspace = Workspace::new();
+    std::fs::create_dir(workspace.source.join("sub")).unwrap();
+    std::fs::create_dir(workspace.source.join("disabled_sub")).unwrap();
+    std::fs::create_dir(workspace.source.join("ffi")).unwrap();
+
+    workspace.write(".config", "# CONFIG_DISABLED_SUB is not set\n");
+    workspace.write(
+        "Kbuild",
+        "obj-y += core.o sub/\nobj-$(CONFIG_DISABLED_SUB) += disabled_sub/\n",
+    );
+    workspace.write(
+        "sub/Kbuild",
+        "ccflags-y += -DSUB_FACTOR=3\nobj-y += sub_math.o\n",
+    );
+    workspace.write(
+        "sub/sub_math.c",
+        "int sub_step(int x) { return x * SUB_FACTOR + 1; }\n",
+    );
+    workspace.write(
+        "disabled_sub/bad.c",
+        "int bad_global = 9; int bad_fn(int x) { return x + bad_global; }\n",
+    );
+    workspace.write(
+        "ffi/bridge.c",
+        "extern int rf_abi_sub_step(int x);\nint c_roundtrip(int x) { return rf_abi_sub_step(x + 2) * 2; }\n",
+    );
+    workspace.write(
+        "core.c",
+        "int c_roundtrip(int x);\nint entry_bidir(int x) { return c_roundtrip(x) + 5; }\n",
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    assert_eq!(job.inactive_source_files, vec!["disabled_sub/bad.c"]);
+    assert_eq!(job.c_boundary_files, vec!["ffi/bridge.c"]);
+    engine.plan(&job.job_id).unwrap();
+    engine.generate(&job.job_id).unwrap();
+    let verified = engine
+        .verify(&job.job_id, "entry_bidir", vec![vec![-4], vec![0], vec![7]])
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+}
+
+#[tokio::test]
+async fn kernel_nostd_profile_and_kbuild_bindings_compile_and_verify() {
+    let workspace = Workspace::new();
+    workspace.write(".config", "CONFIG_KERNEL_PORT=y\n");
+    workspace.write(
+        "Kbuild",
+        "ccflags-y += -DKERNEL_BIAS=9\nobj-$(CONFIG_KERNEL_PORT) += drv.o\n",
+    );
+    workspace.write(
+        "drv.c",
+        r#"
+#include <stdint.h>
+
+union Payload {
+    int32_t s;
+    uint32_t u;
+};
+
+struct Packet {
+    int32_t tag;
+    union Payload data;
+    int32_t vec[2];
+};
+
+static int mix_tag(int32_t t) {
+    return t ^ KERNEL_BIAS;
+}
+
+int process_packet(int32_t raw) {
+    struct Packet p = { mix_tag(raw), { .s = raw + 3 }, { 1, 2 } };
+    return p.tag + (int)(p.data.u & 0x1fu) + p.vec[0] + p.vec[1];
+}
+"#,
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+    engine.plan(&job.job_id).unwrap();
+    let generated = engine.generate(&job.job_id).unwrap();
+    assert_eq!(generated.kernel_profile.as_deref(), Some("no_std_kbuild"));
+    assert_eq!(generated.kbuild_artifacts.len(), 3);
+
+    let attempt_dir = Path::new(&generated.artifact_path)
+        .join("candidates")
+        .join(generated.generation_attempt.to_string());
+    let nostd_src = std::fs::read_to_string(attempt_dir.join("kbuild/rf_kernel_port.rs")).unwrap();
+    let kbuild_src = std::fs::read_to_string(attempt_dir.join("kbuild/Kbuild")).unwrap();
+    let bindings_hdr =
+        std::fs::read_to_string(attempt_dir.join("kbuild/rf_port_bindings.h")).unwrap();
+    assert!(nostd_src.starts_with("#![no_std]\n"));
+    assert!(kbuild_src.contains("CONFIG_KERNEL_PORT=y"));
+    assert!(kbuild_src.contains("obj-y += rf_kernel_port.o"));
+    assert!(bindings_hdr.contains("union Payload;"));
+    assert!(bindings_hdr.contains("struct Packet;"));
+    assert!(bindings_hdr.contains("union Payload data;"));
+    assert!(bindings_hdr.contains("int vec[2];"));
+    assert!(bindings_hdr.contains("int rf_abi_process_packet(int raw);"));
+    assert!(!bindings_hdr.contains("rf_abi_mix_tag"));
+
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "process_packet",
+            vec![vec![-5], vec![0], vec![17]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+    let cmds = &verified.verifications[0].commands;
+    assert!(cmds.iter().any(|c| {
+        c.success()
+            && c.program == "rustc"
+            && c.args.iter().any(|a| a.contains("rf_kernel_port.rs"))
+    }));
+    assert!(cmds.iter().any(|c| {
+        c.success()
+            && c.program == "clang"
+            && c.args.iter().any(|a| a.contains("rf_port_bindings.h"))
+    }));
+
+    // Tampering with kbuild output must mark the verified job stale.
+    std::fs::write(
+        attempt_dir.join("kbuild/rf_kernel_port.rs"),
+        format!("{nostd_src}\n// tampered\n"),
+    )
+    .unwrap();
+    assert_eq!(engine.report(&job.job_id).unwrap().state, "stale");
 }

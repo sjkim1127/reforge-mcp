@@ -501,7 +501,10 @@ impl ReforgeServer {
                 "automatic_manifest_dependency_resolution": false,
                 "c_preprocessing": true,
                 "header_dependency_hashes": true,
-                "rust_generation": "deterministic_clang_ast_int32_subset",
+                "compile_commands_database": true,
+                "kbuild_kconfig_collector": true,
+                "kernel_nostd_kbuild_adapter": true,
+                "rust_generation": "deterministic_clang_ast_typed_c_subset",
                 "behavioral_verification": "fixture_level_library_functions"
             },
             "analysis_backends": {
@@ -512,7 +515,7 @@ impl ReforgeServer {
             "porting_workflow": ["analyze_porting_project", "create_porting_plan", "get_porting_context", "generate_rust", "submit_rust_candidate", "verify_port", "get_porting_report", "list_porting_jobs"],
             "campaign_workflow": ["inventory_project", "get_migration_inventory", "get_migration_source_context", "register_dependency_requirements", "record_dependency_candidate", "plan_dependency_adapter", "create_dependency_campaign", "get_dependency_requirements", "verify_dependency_replacement", "revise_dependency_requirements", "next_migration_tasks", "get_migration_campaign"],
             "requirements": ["clang with UBSan", "rustc", "cargo"],
-            "supported_c": "int32 library functions, arithmetic, comparisons, branches, initialized locals, direct internal calls, include guards, macros, conditional compilation, and int-only header prototypes/shared inline functions; no main, pointers, globals, loops, or external function calls",
+            "supported_c": "signed/unsigned/bool/fixed-width integers (8/16/32/64, size_t, ptrdiff_t), enums, void, repr(C) structs/unions/typedefs, struct bitfields, fixed-size arrays, pointers (int *, const int *, struct *, union *, nested pointers), function pointers (Option<fn>), string literals, file-scope static const tables/constants, sizeof/alignof, loops (for, while, do-while, break, continue), switch/case/default with fallthrough, forward goto cleanup labels, arithmetic/shift/compound assignments, direct internal and indirect calls, external C prototypes/FFI boundary files (ffi/, external/, *.ffi.c, *.external.c), bidirectional C ABI exports (rf_abi_*), compile_commands.json, recursive Kbuild/Kconfig (.config, Kbuild, Makefile), kernel no_std + Kbuild/C-header adapter (kbuild/rf_kernel_port.rs, Kbuild, rf_port_bindings.h), include guards, macros, conditional compilation, and shared inline functions up to 4096 files / 64 MiB; no main, mutable global variables, static locals, backward/cross-scope goto, inline asm, variadics, or uninitialized locals",
             "execution": "local host with time/output limits; not an OS security sandbox",
             "verification_policy": "Completion means the submitted entry-function fixtures passed on the pinned source and candidate; not whole-program equivalence. Undefined behavior in source cases blocks acceptance."
         }).to_string())
@@ -1724,7 +1727,7 @@ impl ReforgeServer {
 #[tool_handler(
     name = "reforge-mcp",
     version = "0.1.0",
-    instructions = "Reforge-MCP provides agent-facing Rust migration campaigns and a restricted C int32 translation backend. Start with get_porting_capabilities. Campaign workflow: inventory_project, inspect paginated files/source context, register_dependency_requirements, agent researches and records candidates, plan_dependency_adapter, agent prepares implementations and local executables, verify_dependency_replacement, next_migration_tasks. Missing replacements can link create_dependency_campaign. Research metadata is agent asserted; server does not search registries or compile dependency probes. Accepted dependency fixtures never mean whole-program completion. C translation workflow: analyze_porting_project, create_porting_plan, generate_rust or submit_rust_candidate, verify_port, get_porting_report. Local execution has limits, not an OS sandbox. Java/C++/Python/Go translation and Joern remain planned."
+    instructions = "Reforge-MCP provides agent-facing Rust migration campaigns and a typed C-to-Rust translation backend (fixed-width/unsigned/bool integers, enums, void, structs/unions, bitfields, fixed arrays, pointers, function pointers, string literals, static const globals, loops, switch, forward goto, sizeof, external C calls, C ABI exports, compile_commands.json, and recursive Kbuild/Kconfig). Start with get_porting_capabilities. Campaign workflow: inventory_project, inspect paginated files/source context, register_dependency_requirements, agent researches and records candidates, plan_dependency_adapter, agent prepares implementations and local executables, verify_dependency_replacement, next_migration_tasks. Missing replacements can link create_dependency_campaign. Research metadata is agent asserted; server does not search registries or compile dependency probes. Accepted dependency fixtures never mean whole-program completion. C translation workflow: analyze_porting_project, create_porting_plan, generate_rust or submit_rust_candidate, verify_port, get_porting_report. Local execution has limits, not an OS sandbox. Java/C++/Python/Go translation and Joern remain planned."
 )]
 impl ServerHandler for ReforgeServer {}
 
