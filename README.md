@@ -135,6 +135,27 @@ python3 scripts/campaign_smoke.py
 - `porting_smoke.py`: drives the stdio MCP server over arithmetic fixtures (6 cases), server restart/resume, global-state rejection, header/macro fixtures (6 cases), and pinned [musl `abs.c`](fixtures/porting/musl-abs/PROVENANCE.md) (6 defined cases passing + `INT_MIN` UB blocked), writing artifacts under `.reforge-demo/`.
 - `campaign_smoke.py`: verifies dependency contract matching between C `strtol` and a Rust parser candidate (8 cases), mismatch rejection, revision invalidation, and restart persistence into `.reforge-demo/campaign-report.json`.
 
+### 1,000+ C Unit Clang Benchmark
+
+Run the multi-threaded Clang AST + deterministic translator + `rustc #![no_std]` corpus profiler:
+
+```bash
+python3 scripts/clang_benchmark.py
+```
+
+By default `scripts/clang_benchmark.py` discovers real C translation units across `fixtures/porting/` and any locally checked-out `vendor/` reference corpora (`c2rust`, `crown`, `c2saferrust`/Laertes, `musl`, `zopfli`), falling back to synthetic C units when `--min-units 1000` is not yet reached, and writes `.reforge-demo/clang-benchmark-report.json`.
+
+Measured across **1,690 real C translation units** (`1,383` musl, `191` Crown, `100` C2Rust unit tests, `10` Laertes, `5` fixtures, `1` Zopfli):
+
+| Stage | Baseline | After Blocker Fixes |
+|---|---|---|
+| Clang AST Parsed (`-ast-dump=json`) | 1,142 / 1,690 (67.6%) | **1,668 / 1,690 (98.7%)** |
+| Translated Units (non-empty) | 99 (+ 7 empty) | **499 (+ 20 empty)** |
+| `rustc --edition=2024` `#![no_std]` Compiled | 36 (36.4% of translated) | **499 (100.0% of translated)** |
+| Translated Functions (`rf_safe_*` wrappers) | 166 (31) | **2,308 (458)** |
+
+Remaining translation rejections in the benchmark reflect intentional fail-closed policies (`static` mutable locals, non-const globals, `GCCAsmStmt` inline assembly, variadic definitions, `main`, `__uint128_t`, `__builtin_va_list`, backward/cross-scope `goto`).
+
 ---
 
 ## Compatibility, Documentation & Development

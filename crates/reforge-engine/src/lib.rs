@@ -24,6 +24,40 @@ use model::{
 };
 use store::Store;
 
+pub use clang::TranslationUnitOutput;
+
+const RUST_PRELUDE: &str = "#![allow(unused_mut, unused_parens, unreachable_code, non_camel_case_types, non_snake_case, dead_code, unused_unsafe, unused_labels, improper_ctypes, improper_ctypes_definitions)]\n#[inline]\nfn rf_ptr<T>(ptr: *mut T) -> *mut T {\n    assert!(!ptr.is_null(), \"null pointer dereference\");\n    ptr\n}\n";
+
+pub fn translate_ast(
+    ast: &serde_json::Value,
+    translation_unit: &Path,
+    root: &Path,
+) -> Result<TranslationUnitOutput> {
+    clang::translate(ast, translation_unit, root)
+}
+
+pub fn render_rust_module(
+    structs: &[StructDef],
+    constants: &[String],
+    external_functions: &[ExternalFunction],
+    functions: &[Function],
+) -> String {
+    let mut rust = String::from(RUST_PRELUDE);
+    for sdef in structs {
+        rust.push_str(&sdef.rust);
+    }
+    for citem in constants {
+        rust.push_str(citem);
+    }
+    for ext in external_functions {
+        rust.push_str(&ext.rust);
+    }
+    for function in functions {
+        rust.push_str(&function.rust);
+    }
+    rust
+}
+
 const MAX_FILES: usize = 4096;
 const OPERATION_SECONDS: u64 = 120;
 const CASE_SECONDS: u64 = 10;
@@ -466,21 +500,12 @@ impl Engine {
             job.state != "analyzed",
             "create_porting_plan must be called before generation"
         );
-        let mut rust = String::from(
-            "#![allow(unused_mut, unused_parens, unreachable_code, non_camel_case_types, non_snake_case, dead_code, unused_unsafe, unused_labels, improper_ctypes, improper_ctypes_definitions)]\n#[inline]\nfn rf_ptr<T>(ptr: *mut T) -> *mut T {\n    assert!(!ptr.is_null(), \"null pointer dereference\");\n    ptr\n}\n",
+        let rust = render_rust_module(
+            &job.structs,
+            &job.constants,
+            &job.external_functions,
+            &job.functions,
         );
-        for sdef in &job.structs {
-            rust.push_str(&sdef.rust);
-        }
-        for citem in &job.constants {
-            rust.push_str(citem);
-        }
-        for ext in &job.external_functions {
-            rust.push_str(&ext.rust);
-        }
-        for function in &job.functions {
-            rust.push_str(&function.rust);
-        }
         self.write_candidate(&mut job, &rust, true)?;
         Ok(job)
     }

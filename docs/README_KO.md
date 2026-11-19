@@ -122,6 +122,27 @@ python3 scripts/campaign_smoke.py
 
 캠페인 데모는 실제 C `strtol`과 Rust 표준 라이브러리 파싱을 비교합니다. 공백·오류 처리 계약을 빠뜨린 후보의 실패, 작성된 어댑터의 8개 입력 통과, 계약 수정 후 검증 만료 및 재시작 후 조회를 확인합니다. `.reforge-demo/campaign-report.json`에 저장됩니다. probe와 어댑터는 사람이 작성한 fixture이며 자동 의존성 포팅 결과는 아닙니다.
 
+### 1,000+ C 유닛 Clang 벤치마크
+
+대규모 실제 C 프로젝트에서 막히는 구문과 `#![no_std]` 컴파일 성공률을 프로파일링하려면 아래 명령을 실행합니다.
+
+```bash
+python3 scripts/clang_benchmark.py
+```
+
+`scripts/clang_benchmark.py`는 `fixtures/porting/` 및 로컬 `vendor/` 참고 코퍼스(`musl`, `crown`, `c2rust`, `c2saferrust`/Laertes, `zopfli`)에서 실제 C 번역 단위를 수집하고(`--min-units 1000` 미만 시 합성 C 유닛으로 보충), 다중 스레드로 Clang JSON AST 덤프, `reforge_engine::translate_ast` 번역, `rustc --edition=2024` `#![no_std]` 빌드를 검증해 `.reforge-demo/clang-benchmark-report.json`을 생성합니다.
+
+**1,690개 실제 C 번역 단위**(`musl` 1,383, `crown` 191, `c2rust-unit` 100, `laertes` 10, `fixtures` 5, `zopfli` 1) 기준 실측 결과:
+
+| 단계 | 초기 기준선 | 블로커 개선 후 |
+|---|---|---|
+| Clang AST 파싱 성공 | 1,142 / 1,690 (67.6%) | **1,668 / 1,690 (98.7%)** |
+| 번역 성공 유닛 (비어 있지 않음) | 99 (+ 7 empty) | **499 (+ 20 empty)** |
+| `rustc --edition=2024` `#![no_std]` 컴파일 성공 | 36 (번역 유닛 중 36.4%) | **499 (번역 유닛 100.0%)** |
+| 번역된 함수 수 (`rf_safe_*` 래퍼) | 166 (31) | **2,308 (458)** |
+
+남은 번역 거부는 가변 `static` 지역 변수, 비상수 전역 변수, 인라인 어셈블리(`GCCAsmStmt`), 가변인자 함수 본문, `main`, `__uint128_t`, `__builtin_va_list`, 역방향 `goto` 등 의도된 fail-closed 정책에 해당합니다.
+
 ## 전환 및 호환성
 
 실행 파일 이름은 `fossil-mcp`에서 `reforge-mcp`로 변경됩니다. 기존 MCP 설정의 command 경로를 갱신해야 합니다. 릴리즈 아카이브도 새 이름을 사용합니다. 기존 로컬 데이터 재사용을 위해 `FOSSIL_CACHE_DIR`, `FOSSIL_LOG`와 SQLite 저장 경로는 유지합니다. GitHub 저장소는 `sjkim1127/reforge-mcp`로 변경했습니다. 기존 로컬 체크아웃 폴더는 그대로 사용해도 됩니다.

@@ -1513,3 +1513,198 @@ int run_contracts(int init_val, int bias) {
         .unwrap();
     assert_eq!(verified.state, "completed", "{}", describe(&verified));
 }
+
+#[tokio::test]
+async fn general_purpose_c11_and_gnu_extensions_translate_and_verify() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "compat.h",
+        r#"
+#include <stddef.h>
+#include <stdint.h>
+
+struct OpaqueHandle;
+void opaque_sink(struct OpaqueHandle *h);
+
+void uncalled_noreturn_log(const char *fmt, ...) __attribute__((noreturn));
+long double uncalled_long_double(long double x);
+
+struct NestedBox {
+    unsigned : 2;
+    int type;
+    struct {
+        int ref;
+        union {
+            int final;
+            uint32_t raw;
+        };
+    };
+};
+
+int helper_double(int x);
+"#,
+    );
+    workspace.write(
+        "compat.c",
+        r#"
+#include "compat.h"
+
+static const unsigned char HEX_U8[] = "0123456789abcdef";
+static const int SHIFT_TBL[2] = { 1 << 3, 64 >> 2 };
+
+__attribute__((noinline, used))
+int helper_double(int x) {
+    return x * 2;
+}
+
+static int apply_cb(int (*cb)(int), int v) {
+    return cb(v);
+}
+
+int eval_compat(int x, int mode) {
+    int local_proto_decl(int);
+    _Static_assert(sizeof(struct NestedBox) >= sizeof(int), "box size");
+    enum LocalBias { BIAS_A = 3, BIAS_B = 7 };
+    typedef int local_i32;
+
+    static const uint32_t LOCAL_LUT[4] = { 1u << 1, 2u << 2, 3u << 3, 4u << 4 };
+    local_i32 braced = { 5 };
+    (void)mode;
+
+    struct OpaqueHandle *opaque_ptr = (struct OpaqueHandle *)0;
+    _Bool has_opaque = opaque_ptr;
+
+    struct NestedBox box = { 0 };
+    box.type = x;
+    box.ref = SHIFT_TBL[0];
+    box.final = BIAS_A + braced + (has_opaque ? 100 : 0);
+
+    union {
+        float f;
+        uint32_t bits;
+    } pun = { 2.0f };
+    int pun_hi = (int)(pun.bits >> 23);
+
+    int (*fp)(int) = &helper_double;
+    int (*fp2)(int) = (int (*)(int))(void (*)(void))fp;
+
+    int elvis = mode ? mode : BIAS_B;
+    const char *fn_name = __func__;
+    unsigned char ch_u8 = HEX_U8[(x & 3)];
+    unsigned char signed_char_lit = (unsigned char)'\xff';
+    int inf_sign = __builtin_isinf_sign(1.0);
+
+    return box.type
+        + box.ref
+        + box.final
+        + pun_hi
+        + apply_cb(fp2, x)
+        + elvis
+        + (int)LOCAL_LUT[x & 3]
+        + (int)ch_u8
+        + (int)signed_char_lit
+        + (int)fn_name[0]
+        + inf_sign;
+}
+"#,
+    );
+
+    let engine = workspace.engine();
+    let job = engine.analyze(&workspace.source).await.unwrap();
+    assert_eq!(job.state, "analyzed", "{:?}", job.unsupported);
+
+    engine.plan(&job.job_id).unwrap();
+    let generated = engine.generate(&job.job_id).unwrap();
+    let lib_rs = std::fs::read_to_string(
+        Path::new(&generated.artifact_path).join("candidates/1/src/lib.rs"),
+    )
+    .unwrap();
+    assert!(lib_rs.contains("pub struct RfStruct_OpaqueHandle"));
+    assert!(lib_rs.contains("r#type"));
+    assert!(lib_rs.contains("r#ref"));
+    assert!(lib_rs.contains("r#final"));
+    assert_eq!(
+        lib_rs
+            .matches("pub extern \"C\" fn rf_helper_double(")
+            .count(),
+        1,
+        "forward prototype must not duplicate defined function:\n{lib_rs}"
+    );
+
+    let verified = engine
+        .verify(
+            &job.job_id,
+            "eval_compat",
+            vec![vec![0, 0], vec![3, 1], vec![-4, 5], vec![7, 0]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "completed", "{}", describe(&verified));
+
+    // Also verify GNU extensions (empty union, StmtExpr, BinaryConditionalOperator, ToUnion)
+    // compile cleanly under #![no_std] via translate_ast + rustc.
+    let gnu_c = workspace.source.join("gnu_ext.c");
+    std::fs::write(
+        &gnu_c,
+        r#"
+union EmptyUnion {
+};
+union NumUnion {
+    int i;
+    float f;
+};
+int eval_gnu(int x) {
+    union EmptyUnion eu;
+    (void)eu;
+    int s = ({ int t = x + 1; t * 2; });
+    int b = x ?: 9;
+    union NumUnion u = (union NumUnion)x;
+    return s + b + u.i;
+}
+"#,
+    )
+    .unwrap();
+    let ast_out = std::process::Command::new("clang")
+        .args([
+            "-std=gnu11",
+            "-Wno-gnu",
+            "-Xclang",
+            "-ast-dump=json",
+            "-fsyntax-only",
+        ])
+        .arg(&gnu_c)
+        .output()
+        .unwrap();
+    assert!(
+        ast_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ast_out.stderr)
+    );
+    let ast_json: serde_json::Value = serde_json::from_slice(&ast_out.stdout).unwrap();
+    let tu = reforge_engine::translate_ast(&ast_json, &gnu_c, &workspace.source).unwrap();
+    let gnu_rs = format!(
+        "#![no_std]\n{}\n",
+        reforge_engine::render_rust_module(
+            &tu.structs,
+            &tu.constants,
+            &tu.prototypes,
+            &tu.functions
+        )
+    );
+    assert!(gnu_rs.contains("pub struct RfUnion_EmptyUnion"));
+    let rs_path = workspace.source.join("gnu_ext.rs");
+    let rlib_path = workspace.source.join("libgnu_ext.rlib");
+    std::fs::write(&rs_path, &gnu_rs).unwrap();
+    let rustc_out = std::process::Command::new("rustc")
+        .args(["--edition=2024", "--crate-type=rlib", "-o"])
+        .arg(&rlib_path)
+        .arg(&rs_path)
+        .output()
+        .unwrap();
+    assert!(
+        rustc_out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&rustc_out.stderr),
+        gnu_rs
+    );
+}

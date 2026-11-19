@@ -4,6 +4,7 @@
 //! forward goto cleanup labels, sizeof/alignof, external prototypes, and C ABI export) to Rust.
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -144,6 +145,19 @@ enum CType {
     },
 }
 
+fn rust_field_name(name: &str) -> String {
+    match name {
+        "self" | "super" | "crate" | "Self" | "_" => format!("rf_kw_{name}"),
+        "as" | "break" | "const" | "continue" | "else" | "enum" | "extern" | "false" | "fn"
+        | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut"
+        | "pub" | "ref" | "return" | "static" | "struct" | "trait" | "true" | "type" | "unsafe"
+        | "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract" | "become" | "box"
+        | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual"
+        | "yield" | "try" | "gen" => format!("r#{name}"),
+        _ => name.to_owned(),
+    }
+}
+
 impl CType {
     fn same_shape(&self, other: &Self) -> bool {
         match (self, other) {
@@ -174,10 +188,6 @@ impl CType {
 
     fn is_pointer(&self) -> bool {
         matches!(self, Self::Ptr { .. })
-    }
-
-    fn is_pointer_like(&self) -> bool {
-        matches!(self, Self::Ptr { .. } | Self::FnPtr { .. })
     }
 
     fn contains_raw_ptr(&self, structs: &StructFieldsMap, unions: &UnionFieldsMap) -> bool {
@@ -276,16 +286,27 @@ impl CType {
             Self::FnPtr { .. } => Ok("None".into()),
             Self::Array(elem, len) => Ok(format!("[{}; {len}]", elem.zero_expr(structs)?)),
             Self::Struct(name) => {
-                let fields = structs
-                    .get(name)
-                    .with_context(|| format!("unknown struct {name} for zero-init"))?;
-                let inits = fields
-                    .iter()
-                    .map(|(fname, fty, _)| Ok(format!("{fname}: {}", fty.zero_expr(structs)?)))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(format!("RfStruct_{name} {{ {} }}", inits.join(", ")))
+                if let Some(fields) = structs.get(name) {
+                    let inits = fields
+                        .iter()
+                        .map(|(fname, fty, _)| {
+                            Ok(format!(
+                                "{}: {}",
+                                rust_field_name(fname),
+                                fty.zero_expr(structs)?
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(format!("RfStruct_{name} {{ {} }}", inits.join(", ")))
+                } else {
+                    Ok(format!(
+                        "unsafe {{ core::mem::zeroed::<RfStruct_{name}>() }}"
+                    ))
+                }
             }
-            Self::Union(name) => Ok(format!("core::mem::zeroed::<RfUnion_{name}>()")),
+            Self::Union(name) => Ok(format!(
+                "unsafe {{ core::mem::zeroed::<RfUnion_{name}>() }}"
+            )),
             Self::Void => bail!("void cannot be zero-initialized"),
         }
     }
@@ -329,6 +350,13 @@ impl CType {
         if let Some(prefix) = s.strip_suffix('*') {
             let prefix = prefix.trim();
             let (inner_str, inner_const) = strip_pointee_qualifiers(prefix);
+            if let Some(res) = resolve_bare_fn_type(inner_str, typedefs, depth + 1) {
+                let (params, ret) = res?;
+                return Ok(Self::FnPtr {
+                    params,
+                    ret: Box::new(ret),
+                });
+            }
             let inner = Self::parse_str_depth(inner_str, typedefs, depth + 1)?;
             return Ok(Self::Ptr {
                 inner: Box::new(inner),
@@ -336,7 +364,7 @@ impl CType {
             });
         }
 
-        // Fixed-size array syntax: `T[N]` or `T[M][N]` or `T (*)[N]`
+        // Fixed-size array syntax: `T[N]` or `T[M][N]` or `T (*)[N]` or flexible `T[]`
         if s.ends_with(']')
             && let Some((elem_str, len, is_ptr_to_arr)) = split_array_type(s)
         {
@@ -355,6 +383,9 @@ impl CType {
         if let Some(resolved) = typedefs.get(base_raw) {
             return Self::parse_str_depth(resolved, typedefs, depth + 1);
         }
+        if let Some(resolved) = resolve_anon_record_type(base_raw, typedefs) {
+            return Self::parse_str_depth(resolved, typedefs, depth + 1);
+        }
 
         if let Some(kind) = parse_int_kind(base_raw) {
             return Ok(Self::Int(kind));
@@ -363,7 +394,7 @@ impl CType {
         match base_raw {
             "void" => Ok(Self::Void),
             "float" => Ok(Self::Float(FloatKind::F32)),
-            "double" => Ok(Self::Float(FloatKind::F64)),
+            "double" | "long double" => Ok(Self::Float(FloatKind::F64)),
             other => {
                 if let Some(tag) = other.strip_prefix("struct ") {
                     let tag = tag.trim();
@@ -530,7 +561,20 @@ fn parse_param_list(
     let mut params = Vec::new();
     for p in split_top_level_commas(trimmed) {
         ensure!(p != "...", "variadic functions are unsupported");
-        let pty = CType::parse_str_depth(p, typedefs, depth)?;
+        let pty = match CType::parse_str_depth(p, typedefs, depth) {
+            Ok(t) => t,
+            Err(orig_err) => {
+                if let Some(res) = resolve_bare_fn_type(p, typedefs, depth + 1) {
+                    let (fn_params, ret) = res?;
+                    CType::FnPtr {
+                        params: fn_params,
+                        ret: Box::new(ret),
+                    }
+                } else {
+                    return Err(orig_err);
+                }
+            }
+        };
         ensure!(!matches!(pty, CType::Void), "void parameter unsupported");
         params.push(pty);
     }
@@ -555,7 +599,11 @@ fn split_array_type(s: &str) -> Option<(String, usize, bool)> {
     let rel_close = s[open..].find(']')?;
     let close = open + rel_close;
     let len_str = s[open + 1..close].trim();
-    let len = len_str.parse::<usize>().ok()?;
+    let len = if len_str.is_empty() {
+        0
+    } else {
+        len_str.parse::<usize>().ok()?
+    };
     let before = s[..open].trim();
     let after = s[close + 1..].trim();
     if let Some(stripped) = before.strip_suffix("(*)") {
@@ -566,9 +614,137 @@ fn split_array_type(s: &str) -> Option<(String, usize, bool)> {
     Some((elem, len, false))
 }
 
+fn split_trailing_parens(s: &str) -> Option<(&str, &str)> {
+    let trimmed = s.trim();
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut open_idx = None;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_idx = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open_idx?;
+    Some((
+        trimmed[..open].trim(),
+        trimmed[open + 1..trimmed.len() - 1].trim(),
+    ))
+}
+
+fn resolve_bare_fn_type(
+    raw: &str,
+    typedefs: &BTreeMap<String, String>,
+    depth: usize,
+) -> Option<Result<(Vec<CType>, CType)>> {
+    if depth >= 16 {
+        return None;
+    }
+    let mut cur = strip_trailing_qualifiers(raw.trim());
+    for _ in 0..(16 - depth) {
+        if let Some(next) = typedefs.get(cur) {
+            cur = strip_trailing_qualifiers(next.trim());
+        } else {
+            break;
+        }
+    }
+    if cur.starts_with("struct ")
+        || cur.starts_with("union ")
+        || cur.starts_with("enum ")
+        || split_fn_ptr(cur).is_some()
+    {
+        return None;
+    }
+    let (ret_str, params_str) = split_trailing_parens(cur)?;
+    if ret_str.is_empty() || ret_str.ends_with("*)") {
+        return None;
+    }
+    let res = (|| {
+        let ret = CType::parse_str_depth(ret_str, typedefs, depth + 1)?;
+        let params = parse_param_list(params_str, typedefs, depth + 1)?;
+        Ok((params, ret))
+    })();
+    Some(res)
+}
+
+fn resolve_anon_record_type<'a>(
+    base_raw: &str,
+    typedefs: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    let tag = if base_raw.starts_with("struct ") {
+        "struct"
+    } else if base_raw.starts_with("union ") {
+        "union"
+    } else {
+        return None;
+    };
+    let rest = base_raw.strip_suffix(')')?;
+    let at_pos = rest
+        .rfind("unnamed at ")
+        .map(|i| i + "unnamed at ".len())
+        .or_else(|| {
+            rest.rfind("anonymous at ")
+                .map(|i| i + "anonymous at ".len())
+        })?;
+    let loc_str = &rest[at_pos..];
+    let mut parts = loc_str.rsplitn(3, ':');
+    let col = parts.next()?.parse::<usize>().ok()?;
+    let line = parts.next()?.parse::<usize>().ok()?;
+    let file_part = parts.next()?;
+    let key = format!("{tag} @anon:{file_part}:{line}:{col}");
+    if let Some(found) = typedefs.get(&key) {
+        return Some(found.as_str());
+    }
+    if let Ok(canon) = Path::new(file_part).canonicalize() {
+        let canon_key = format!("{tag} @anon:{}:{line}:{col}", canon.display());
+        if let Some(found) = typedefs.get(&canon_key) {
+            return Some(found.as_str());
+        }
+    }
+    None
+}
+
 fn strip_trailing_qualifiers(mut s: &str) -> &str {
     loop {
         let trimmed = s.trim();
+        if trimmed.ends_with(')') {
+            let mut depth = 0usize;
+            let mut matched_open = None;
+            for (idx, ch) in trimmed.char_indices().rev() {
+                match ch {
+                    ')' => depth += 1,
+                    '(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            matched_open = Some(idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(open) = matched_open {
+                let before = trimmed[..open].trim_end();
+                if let Some(rest) = before.strip_suffix("__attribute__")
+                    && rest
+                        .chars()
+                        .last()
+                        .is_none_or(|c| c.is_whitespace() || c == ')' || c == '*')
+                {
+                    s = rest.trim();
+                    continue;
+                }
+            }
+        }
         let next = [
             "const",
             "volatile",
@@ -580,6 +756,8 @@ fn strip_trailing_qualifiers(mut s: &str) -> &str {
             "_Null_unspecified",
             "__nonnull",
             "__nullable",
+            "_Noreturn",
+            "noreturn",
         ]
         .into_iter()
         .find_map(|q| trimmed.strip_suffix(q));
@@ -674,45 +852,108 @@ fn expansion_location(location: &Value) -> &Value {
     }
 }
 
+fn file_from_loc(loc: &Value) -> Option<&str> {
+    loc["expansionLoc"]["file"]
+        .as_str()
+        .or_else(|| loc["file"].as_str())
+        .or_else(|| loc["spellingLoc"]["file"].as_str())
+}
+
+fn offset_to_line_col(source: &str, loc: &Value) -> Result<(usize, usize)> {
+    let exp = expansion_location(loc);
+    if let Some(offset) = exp["offset"].as_u64().map(|o| o as usize)
+        && offset <= source.len()
+        && source.is_char_boundary(offset)
+    {
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+        let col = match prefix.rfind('\n') {
+            Some(pos) => offset - pos,
+            None => offset + 1,
+        };
+        return Ok((line, col));
+    }
+    let line = exp["line"].as_u64().map(|l| l.max(1) as usize).unwrap_or(1);
+    let col = exp["col"].as_u64().map(|c| c.max(1) as usize).unwrap_or(1);
+    Ok((line, col))
+}
+
 fn line_from_offset(source: &str, loc: &Value) -> Result<usize> {
-    let loc = expansion_location(loc);
-    let offset = loc["offset"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing source offset"))? as usize;
-    ensure!(
-        offset <= source.len() && source.is_char_boundary(offset),
-        "invalid source offset"
-    );
-    Ok(source[..offset].bytes().filter(|b| *b == b'\n').count() + 1)
+    Ok(offset_to_line_col(source, loc)?.0)
+}
+
+fn is_benign_attr_or_comment(kind_name: &str) -> bool {
+    kind_name.ends_with("Comment")
+        || matches!(
+            kind_name,
+            "BuiltinAttr"
+                | "NoThrowAttr"
+                | "NoInlineAttr"
+                | "UsedAttr"
+                | "ConstAttr"
+                | "PureAttr"
+                | "VisibilityAttr"
+                | "UnusedAttr"
+                | "AlwaysInlineAttr"
+                | "GNUInlineAttr"
+                | "InlineAttr"
+                | "ColdAttr"
+                | "HotAttr"
+                | "NonNullAttr"
+                | "AllocSizeAttr"
+                | "FormatAttr"
+                | "WarnUnusedResultAttr"
+                | "NoreturnAttr"
+                | "C11NoReturnAttr"
+                | "ReturnsTwiceAttr"
+                | "DisableTailCallsAttr"
+                | "NoProfileFunctionAttr"
+                | "RestrictAttr"
+                | "DeprecatedAttr"
+                | "UnavailableAttr"
+                | "AlignedAttr"
+                | "MaxFieldAlignmentAttr"
+                | "PackedAttr"
+                | "TransparentUnionAttr"
+                | "MayAliasAttr"
+                | "WeakAttr"
+        )
+}
+
+fn collect_enum_decl(
+    node: &Value,
+    typedefs: &BTreeMap<String, String>,
+    enum_constants: &mut BTreeMap<String, (i64, IntKind)>,
+) {
+    let mut next_val: i64 = 0;
+    for item in children(node) {
+        if kind(item) != "EnumConstantDecl" {
+            continue;
+        }
+        let val = if let Some(first) = children(item).first() {
+            eval_constant_int(first).unwrap_or(next_val)
+        } else {
+            next_val
+        };
+        let ik = CType::from_node_type(&item["type"], typedefs)
+            .ok()
+            .and_then(|t| match t {
+                CType::Int(k) => Some(k),
+                _ => None,
+            })
+            .unwrap_or(IntKind::I32);
+        enum_constants.insert(text(item, "id").to_owned(), (val, ik));
+        next_val = val.saturating_add(1);
+    }
 }
 
 fn parse_fn_signature(
     qual_type: &str,
     typedefs: &BTreeMap<String, String>,
 ) -> Result<(Vec<CType>, CType)> {
-    let trimmed = qual_type.trim();
-    ensure!(
-        trimmed.ends_with(')'),
-        "invalid function type {qual_type:?}"
-    );
-    let mut depth = 0usize;
-    let mut open_idx = None;
-    for (idx, ch) in trimmed.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                depth -= 1;
-                if depth == 0 {
-                    open_idx = Some(idx);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let open = open_idx.with_context(|| format!("invalid function type {qual_type:?}"))?;
-    let ret_str = trimmed[..open].trim();
-    let params_str = trimmed[open + 1..trimmed.len() - 1].trim();
+    let clean = strip_trailing_qualifiers(qual_type);
+    let (ret_str, params_str) = split_trailing_parens(clean)
+        .with_context(|| format!("invalid function type {qual_type:?}"))?;
     let ret = CType::parse_str(ret_str, typedefs)?;
     let params = parse_param_list(params_str, typedefs, 0)?;
     Ok((params, ret))
@@ -878,7 +1119,11 @@ fn parse_c_string_literal(raw: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn format_string_literal_array(raw: &str, expected_len: Option<usize>) -> Result<String> {
+fn format_string_literal_array(
+    raw: &str,
+    expected_len: Option<usize>,
+    elem_ik: IntKind,
+) -> Result<String> {
     let mut bytes = parse_c_string_literal(raw)?;
     if let Some(len) = expected_len {
         if bytes.len() == len + 1 && bytes.last() == Some(&0) {
@@ -890,7 +1135,7 @@ fn format_string_literal_array(raw: &str, expected_len: Option<usize>) -> Result
         );
         bytes.resize(len, 0);
     }
-    let char_rty = IntKind::Char.rust_type();
+    let char_rty = elem_ik.rust_type();
     let elems = bytes
         .iter()
         .map(|b| {
@@ -906,12 +1151,23 @@ fn format_string_literal_array(raw: &str, expected_len: Option<usize>) -> Result
 }
 
 fn local_initializer(declaration: &Value) -> Result<Option<&Value>> {
-    let ch = children(declaration);
-    ensure!(
-        ch.len() <= 1 && ch.iter().all(|c| !kind(c).ends_with("Attr")),
-        "locals must have zero or one initializer and no attributes"
-    );
-    Ok(ch.first())
+    let mut init: Option<&Value> = None;
+    for child in children(declaration) {
+        let k = kind(child);
+        if is_benign_attr_or_comment(k) {
+            continue;
+        }
+        ensure!(
+            !k.ends_with("Attr"),
+            "locals must have zero or one initializer and no unsupported attributes"
+        );
+        ensure!(
+            init.is_none(),
+            "locals must have zero or one initializer and no unsupported attributes"
+        );
+        init = Some(child);
+    }
+    Ok(init)
 }
 
 fn is_scalar_type(ty: &CType) -> bool {
@@ -1153,11 +1409,308 @@ fn analyze_pointer_params(
     (contracts, wrapper)
 }
 
+struct RecordEntry<'a> {
+    rel_file: String,
+    node: &'a Value,
+    name: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_nested_records<'a>(
+    node: &'a Value,
+    rel_file: &str,
+    physical_file: &Path,
+    clang_file: &str,
+    anon_typedefs: &BTreeMap<String, String>,
+    anon_counter: &mut usize,
+    typedefs: &mut BTreeMap<String, String>,
+    file_sources: &mut BTreeMap<String, String>,
+    out: &mut Vec<RecordEntry<'a>>,
+) -> Result<()> {
+    let mut cur_clang_file = clang_file.to_owned();
+    if let Some(f) = file_from_loc(&node["loc"]) {
+        cur_clang_file = f.to_owned();
+    }
+    for child in children(node) {
+        if kind(child) == "RecordDecl" && child["completeDefinition"].as_bool() == Some(true) {
+            collect_nested_records(
+                child,
+                rel_file,
+                physical_file,
+                &cur_clang_file,
+                anon_typedefs,
+                anon_counter,
+                typedefs,
+                file_sources,
+                out,
+            )?;
+        }
+    }
+    let tag = text(node, "tagUsed");
+    let raw_name = text(node, "name");
+    let name = if !raw_name.is_empty() {
+        raw_name.to_owned()
+    } else if let Some(td_name) = anon_typedefs.get(text(node, "id")) {
+        td_name.clone()
+    } else {
+        let synth = format!("anon_{}", *anon_counter);
+        *anon_counter += 1;
+        synth
+    };
+    if raw_name.is_empty() && matches!(tag, "struct" | "union") {
+        if !file_sources.contains_key(rel_file)
+            && let Ok(src) = std::fs::read_to_string(physical_file)
+        {
+            file_sources.insert(rel_file.to_owned(), src);
+        }
+        if let Some(source) = file_sources.get(rel_file) {
+            let begin = if node["range"]["begin"].is_object() {
+                &node["range"]["begin"]
+            } else {
+                &node["loc"]
+            };
+            if let Ok((line, col)) = offset_to_line_col(source, begin) {
+                let target = format!("{tag} {name}");
+                typedefs.insert(
+                    format!("{tag} @anon:{cur_clang_file}:{line}:{col}"),
+                    target.clone(),
+                );
+                typedefs.insert(
+                    format!("{tag} @anon:{}:{line}:{col}", physical_file.display()),
+                    target.clone(),
+                );
+                let sp = begin
+                    .get("spellingLoc")
+                    .or_else(|| node["loc"].get("spellingLoc"));
+                if let Some(sp) = sp
+                    && let (Some(sl), Some(sc)) = (sp["line"].as_u64(), sp["col"].as_u64())
+                {
+                    let sf = sp["file"].as_str().unwrap_or(&cur_clang_file);
+                    typedefs.insert(format!("{tag} @anon:{sf}:{sl}:{sc}"), target.clone());
+                    if let Ok(canon_sf) = Path::new(sf).canonicalize() {
+                        typedefs.insert(
+                            format!("{tag} @anon:{}:{sl}:{sc}", canon_sf.display()),
+                            target,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    out.push(RecordEntry {
+        rel_file: rel_file.to_owned(),
+        node,
+        name,
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_record_entry(
+    node: &Value,
+    mut name: String,
+    rel_file: String,
+    source: &str,
+    rename_on_collision: bool,
+    anon_counter: &mut usize,
+    typedefs: &mut BTreeMap<String, String>,
+    enum_constants: &mut BTreeMap<String, (i64, IntKind)>,
+    structs_map: &mut StructFieldsMap,
+    unions_map: &mut UnionFieldsMap,
+    seen_records: &mut BTreeSet<String>,
+    structs_out: &mut Vec<StructDef>,
+) -> Result<()> {
+    let tag = text(node, "tagUsed");
+    ensure!(
+        matches!(tag, "struct" | "union"),
+        "unsupported record tag {tag:?}; only struct and union are supported"
+    );
+    if node["completeDefinition"].as_bool() != Some(true) {
+        return Ok(());
+    }
+    identifier(&name)?;
+    let key = format!("{tag}:{name}");
+    if !seen_records.insert(key) {
+        if !rename_on_collision {
+            return Ok(());
+        }
+        let orig = name.clone();
+        name = format!("{orig}_local_{}", *anon_counter);
+        *anon_counter += 1;
+        seen_records.insert(format!("{tag}:{name}"));
+        typedefs.insert(format!("{tag} {orig}"), format!("{tag} {name}"));
+    }
+
+    if tag == "struct" {
+        let mut fields_typed = Vec::new();
+        let mut fields_model = Vec::new();
+        let mut field_lines = Vec::new();
+        let mut default_lines = Vec::new();
+        let mut field_idx = 0usize;
+
+        for child in children(node) {
+            let ck = kind(child);
+            if matches!(ck, "RecordDecl" | "IndirectFieldDecl") || is_benign_attr_or_comment(ck) {
+                continue;
+            }
+            if ck == "EnumDecl" {
+                collect_enum_decl(child, typedefs, enum_constants);
+                continue;
+            }
+            ensure!(
+                ck == "FieldDecl",
+                "unsupported declaration {ck} inside struct {name}"
+            );
+            let raw_fname = text(child, "name");
+            if raw_fname.is_empty() && child["isBitfield"].as_bool() == Some(true) {
+                continue;
+            }
+            let fname = if raw_fname.is_empty() {
+                let f = format!("rf_anon_{field_idx}");
+                field_idx += 1;
+                f
+            } else {
+                identifier(raw_fname)?;
+                field_idx += 1;
+                raw_fname.to_owned()
+            };
+            let fty = CType::from_node_type(&child["type"], typedefs)?;
+            ensure!(
+                !matches!(fty, CType::Void),
+                "void field in struct {name} is unsupported"
+            );
+            let bitwidth = if child["isBitfield"].as_bool() == Some(true) {
+                let CType::Int(ik) = fty else {
+                    bail!("bitfield {name}.{fname} must have integer type");
+                };
+                let w = children(child)
+                    .iter()
+                    .filter(|c| !is_benign_attr_or_comment(kind(c)))
+                    .find_map(eval_constant_int)
+                    .with_context(|| format!("missing bitfield width on {name}.{fname}"))?;
+                ensure!(
+                    w >= 1 && w <= ik.bit_width() as i64,
+                    "bitfield width {w} out of range on {name}.{fname}"
+                );
+                Some(w as u32)
+            } else {
+                None
+            };
+            let rty = fty.rust_type();
+            let rf_fname = rust_field_name(&fname);
+            field_lines.push(format!("    pub {rf_fname}: {rty},"));
+            fields_model.push(StructField {
+                name: fname.clone(),
+                c_type: fty.c_type(),
+                rust_type: rty,
+            });
+            fields_typed.push((fname, fty, bitwidth));
+        }
+        structs_map.insert(name.clone(), fields_typed);
+        for (fname, fty, _) in &structs_map[&name] {
+            let z = fty.zero_expr(structs_map)?;
+            let rf_fname = rust_field_name(fname);
+            default_lines.push(format!("            {rf_fname}: {z},"));
+        }
+        let rust_name = format!("RfStruct_{name}");
+        let rust = format!(
+            "#[repr(C)]\n#[derive(Clone, Copy, Debug)]\npub struct {rust_name} {{\n{}\n}}\nimpl Default for {rust_name} {{\n    fn default() -> Self {{\n        unsafe {{\n            Self {{\n{}\n            }}\n        }}\n    }}\n}}\n",
+            field_lines.join("\n"),
+            default_lines.join("\n"),
+        );
+        structs_out.push(StructDef {
+            name,
+            rust_name,
+            fields: fields_model,
+            source_file: rel_file,
+            line_start: line_from_offset(source, &node["range"]["begin"])?,
+            line_end: line_from_offset(source, &node["range"]["end"])?,
+            rust,
+        });
+    } else {
+        // union
+        let mut fields_typed = Vec::new();
+        let mut fields_model = Vec::new();
+        let mut field_lines = Vec::new();
+        let mut field_idx = 0usize;
+
+        for child in children(node) {
+            let ck = kind(child);
+            if matches!(ck, "RecordDecl" | "IndirectFieldDecl") || is_benign_attr_or_comment(ck) {
+                continue;
+            }
+            if ck == "EnumDecl" {
+                collect_enum_decl(child, typedefs, enum_constants);
+                continue;
+            }
+            ensure!(
+                ck == "FieldDecl",
+                "unsupported declaration {ck} inside union {name}"
+            );
+            let raw_fname = text(child, "name");
+            if raw_fname.is_empty() && child["isBitfield"].as_bool() == Some(true) {
+                continue;
+            }
+            ensure!(
+                child["isBitfield"].as_bool() != Some(true),
+                "bitfield inside union {name} is unsupported"
+            );
+            let fname = if raw_fname.is_empty() {
+                let f = format!("rf_anon_{field_idx}");
+                field_idx += 1;
+                f
+            } else {
+                identifier(raw_fname)?;
+                field_idx += 1;
+                raw_fname.to_owned()
+            };
+            let fty = CType::from_node_type(&child["type"], typedefs)?;
+            ensure!(
+                !matches!(fty, CType::Void),
+                "void field in union {name} is unsupported"
+            );
+            let rty = fty.rust_type();
+            let rf_fname = rust_field_name(&fname);
+            field_lines.push(format!("    pub {rf_fname}: {rty},"));
+            fields_model.push(StructField {
+                name: fname.clone(),
+                c_type: fty.c_type(),
+                rust_type: rty,
+            });
+            fields_typed.push((fname, fty));
+        }
+        unions_map.insert(name.clone(), fields_typed);
+        let rust_name = format!("RfUnion_{name}");
+        let rust = if fields_model.is_empty() {
+            format!(
+                "#[repr(C)]\n#[derive(Clone, Copy, Debug, Default)]\npub struct {rust_name} {{\n    _private: [u8; 0],\n}}\n"
+            )
+        } else {
+            format!(
+                "#[repr(C)]\n#[derive(Clone, Copy)]\npub union {rust_name} {{\n{}\n}}\nimpl Default for {rust_name} {{\n    fn default() -> Self {{\n        unsafe {{ core::mem::zeroed() }}\n    }}\n}}\nimpl core::fmt::Debug for {rust_name} {{\n    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{\n        f.write_str(\"{rust_name}\")\n    }}\n}}\n",
+                field_lines.join("\n"),
+            )
+        };
+        structs_out.push(StructDef {
+            name: format!("union:{name}"),
+            rust_name,
+            fields: fields_model,
+            source_file: rel_file,
+            line_start: line_from_offset(source, &node["range"]["begin"])?,
+            line_end: line_from_offset(source, &node["range"]["end"])?,
+            rust,
+        });
+    }
+    Ok(())
+}
+
 pub fn translate(
     ast: &Value,
     translation_unit: &Path,
     root: &Path,
 ) -> Result<TranslationUnitOutput> {
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = root_canon.as_path();
     ensure!(
         kind(ast) == "TranslationUnitDecl",
         "unexpected Clang AST root"
@@ -1168,15 +1721,15 @@ pub fn translate(
     let mut anon_typedefs: BTreeMap<String, String> = BTreeMap::new();
     let mut anon_tags: BTreeMap<String, String> = BTreeMap::new();
     let mut enum_constants: BTreeMap<String, (i64, IntKind)> = BTreeMap::new();
-    let mut record_nodes: Vec<(String, &Value)> = Vec::new();
+    let mut top_records: Vec<(String, std::path::PathBuf, String, &Value)> = Vec::new();
+    let mut file_sources: BTreeMap<String, String> = BTreeMap::new();
 
     let mut current_file = translation_unit.to_path_buf();
     for node in children(ast) {
         if node["isImplicit"].as_bool() == Some(true) {
             continue;
         }
-        let location = expansion_location(&node["loc"]);
-        if let Some(file) = location["file"].as_str() {
+        if let Some(file) = file_from_loc(&node["loc"]) {
             current_file = Path::new(file).to_path_buf();
         }
         let Ok(physical_file) = current_file.canonicalize() else {
@@ -1185,42 +1738,29 @@ pub fn translate(
         let in_project = physical_file.starts_with(root);
 
         match kind(node) {
-            "RecordDecl" if in_project => {
+            "RecordDecl" => {
                 if text(node, "name").is_empty() {
                     anon_tags.insert(
                         text(node, "id").to_owned(),
                         text(node, "tagUsed").to_owned(),
                     );
                 }
-                if let Some(rel) = physical_file
-                    .strip_prefix(root)
-                    .ok()
-                    .and_then(|p| p.to_str())
+                if in_project
+                    && let Some(rel) = physical_file
+                        .strip_prefix(root)
+                        .ok()
+                        .and_then(|p| p.to_str())
                 {
-                    record_nodes.push((rel.to_owned(), node));
+                    top_records.push((
+                        rel.to_owned(),
+                        physical_file.clone(),
+                        current_file.to_string_lossy().into_owned(),
+                        node,
+                    ));
                 }
             }
             "EnumDecl" => {
-                let mut next_val: i64 = 0;
-                for item in children(node) {
-                    if kind(item) != "EnumConstantDecl" {
-                        continue;
-                    }
-                    let val = if let Some(first) = children(item).first() {
-                        eval_constant_int(first).unwrap_or(next_val)
-                    } else {
-                        next_val
-                    };
-                    let ik = CType::from_node_type(&item["type"], &typedefs)
-                        .ok()
-                        .and_then(|t| match t {
-                            CType::Int(k) => Some(k),
-                            _ => None,
-                        })
-                        .unwrap_or(IntKind::I32);
-                    enum_constants.insert(text(item, "id").to_owned(), (val, ik));
-                    next_val = val.saturating_add(1);
-                }
+                collect_enum_decl(node, &typedefs, &mut enum_constants);
             }
             "TypedefDecl" => {
                 let td_name = text(node, "name");
@@ -1255,159 +1795,63 @@ pub fn translate(
         }
     }
 
+    let mut record_nodes: Vec<RecordEntry<'_>> = Vec::new();
+    let mut anon_counter = 0usize;
+    for (rel_file, physical_file, clang_file, node) in top_records {
+        if node["completeDefinition"].as_bool() != Some(true) {
+            continue;
+        }
+        collect_nested_records(
+            node,
+            &rel_file,
+            &physical_file,
+            &clang_file,
+            &anon_typedefs,
+            &mut anon_counter,
+            &mut typedefs,
+            &mut file_sources,
+            &mut record_nodes,
+        )?;
+    }
+
     let mut structs_map: BTreeMap<String, Vec<(String, CType, Option<u32>)>> = BTreeMap::new();
     let mut unions_map: BTreeMap<String, Vec<(String, CType)>> = BTreeMap::new();
     let mut structs = Vec::new();
     let mut seen_records = BTreeSet::new();
 
-    for (rel_file, node) in record_nodes {
-        let tag = text(node, "tagUsed");
-        ensure!(
-            matches!(tag, "struct" | "union"),
-            "unsupported record tag {tag:?}; only struct and union are supported"
-        );
-        if node["completeDefinition"].as_bool() != Some(true) {
-            continue;
-        }
-        let name = if !text(node, "name").is_empty() {
-            text(node, "name").to_owned()
-        } else {
-            let id = text(node, "id");
-            anon_typedefs
-                .get(id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unnamed {tag} without typedef is unsupported"))?
-        };
-        identifier(&name)?;
-        if !seen_records.insert(format!("{tag}:{name}")) {
-            continue;
-        }
+    for RecordEntry {
+        rel_file,
+        node,
+        name,
+    } in record_nodes
+    {
         let physical_file = root.join(&rel_file);
-        let source = std::fs::read_to_string(&physical_file)?;
-
-        if tag == "struct" {
-            let mut fields_typed = Vec::new();
-            let mut fields_model = Vec::new();
-            let mut field_lines = Vec::new();
-            let mut default_lines = Vec::new();
-
-            for child in children(node) {
-                if kind(child) == "RecordDecl" {
-                    continue;
-                }
-                ensure!(
-                    kind(child) == "FieldDecl",
-                    "unsupported declaration {} inside struct {name}",
-                    kind(child)
-                );
-                let fname = text(child, "name");
-                identifier(fname)?;
-                let fty = CType::from_node_type(&child["type"], &typedefs)?;
-                ensure!(
-                    !matches!(fty, CType::Void),
-                    "void field in struct {name} is unsupported"
-                );
-                let bitwidth = if child["isBitfield"].as_bool() == Some(true) {
-                    let CType::Int(ik) = fty else {
-                        bail!("bitfield {name}.{fname} must have integer type");
-                    };
-                    let w = children(child)
-                        .first()
-                        .and_then(eval_constant_int)
-                        .with_context(|| format!("missing bitfield width on {name}.{fname}"))?;
-                    ensure!(
-                        w >= 1 && w <= ik.bit_width() as i64,
-                        "bitfield width {w} out of range on {name}.{fname}"
-                    );
-                    Some(w as u32)
-                } else {
-                    None
-                };
-                let rty = fty.rust_type();
-                field_lines.push(format!("    pub {fname}: {rty},"));
-                fields_model.push(StructField {
-                    name: fname.to_owned(),
-                    c_type: fty.c_type(),
-                    rust_type: rty,
-                });
-                fields_typed.push((fname.to_owned(), fty, bitwidth));
-            }
-            structs_map.insert(name.clone(), fields_typed);
-            for (fname, fty, _) in &structs_map[&name] {
-                let z = fty.zero_expr(&structs_map)?;
-                default_lines.push(format!("            {fname}: {z},"));
-            }
-            let rust_name = format!("RfStruct_{name}");
-            let rust = format!(
-                "#[repr(C)]\n#[derive(Clone, Copy, Debug)]\npub struct {rust_name} {{\n{}\n}}\nimpl Default for {rust_name} {{\n    fn default() -> Self {{\n        unsafe {{\n            Self {{\n{}\n            }}\n        }}\n    }}\n}}\n",
-                field_lines.join("\n"),
-                default_lines.join("\n"),
-            );
-            structs.push(StructDef {
-                name,
-                rust_name,
-                fields: fields_model,
-                source_file: rel_file,
-                line_start: line_from_offset(&source, &node["range"]["begin"])?,
-                line_end: line_from_offset(&source, &node["range"]["end"])?,
-                rust,
-            });
-        } else {
-            // union
-            let mut fields_typed = Vec::new();
-            let mut fields_model = Vec::new();
-            let mut field_lines = Vec::new();
-
-            for child in children(node) {
-                if kind(child) == "RecordDecl" {
-                    continue;
-                }
-                ensure!(
-                    kind(child) == "FieldDecl",
-                    "unsupported declaration {} inside union {name}",
-                    kind(child)
-                );
-                ensure!(
-                    child["isBitfield"].as_bool() != Some(true),
-                    "bitfield inside union {name} is unsupported"
-                );
-                let fname = text(child, "name");
-                identifier(fname)?;
-                let fty = CType::from_node_type(&child["type"], &typedefs)?;
-                ensure!(
-                    !matches!(fty, CType::Void),
-                    "void field in union {name} is unsupported"
-                );
-                let rty = fty.rust_type();
-                field_lines.push(format!("    pub {fname}: {rty},"));
-                fields_model.push(StructField {
-                    name: fname.to_owned(),
-                    c_type: fty.c_type(),
-                    rust_type: rty,
-                });
-                fields_typed.push((fname.to_owned(), fty));
-            }
-            unions_map.insert(name.clone(), fields_typed);
-            let rust_name = format!("RfUnion_{name}");
-            let rust = format!(
-                "#[repr(C)]\n#[derive(Clone, Copy)]\npub union {rust_name} {{\n{}\n}}\nimpl Default for {rust_name} {{\n    fn default() -> Self {{\n        unsafe {{ core::mem::zeroed() }}\n    }}\n}}\nimpl core::fmt::Debug for {rust_name} {{\n    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{\n        f.write_str(\"{rust_name}\")\n    }}\n}}\n",
-                field_lines.join("\n"),
-            );
-            structs.push(StructDef {
-                name: format!("union:{name}"),
-                rust_name,
-                fields: fields_model,
-                source_file: rel_file,
-                line_start: line_from_offset(&source, &node["range"]["begin"])?,
-                line_end: line_from_offset(&source, &node["range"]["end"])?,
-                rust,
-            });
+        if !file_sources.contains_key(&rel_file) {
+            file_sources.insert(rel_file.clone(), std::fs::read_to_string(&physical_file)?);
         }
+        let source = file_sources[&rel_file].clone();
+        emit_record_entry(
+            node,
+            name,
+            rel_file,
+            &source,
+            false,
+            &mut anon_counter,
+            &mut typedefs,
+            &mut enum_constants,
+            &mut structs_map,
+            &mut unions_map,
+            &mut seen_records,
+            &mut structs,
+        )?;
     }
 
     // Pass 2: collect static const globals, translate project functions, and collect prototypes.
     let mut constants = Vec::new();
     let mut const_globals: BTreeMap<String, (String, CType, bool)> = BTreeMap::new();
+    let mut unsupported_globals: BTreeMap<String, String> = BTreeMap::new();
+    let mut variadic_prototypes: BTreeSet<String> = BTreeSet::new();
+    let mut unsupported_prototypes: BTreeMap<String, String> = BTreeMap::new();
     let mut functions = Vec::new();
     let mut prototypes: BTreeMap<String, ExternalFunction> = BTreeMap::new();
     let mut current_file = translation_unit.to_path_buf();
@@ -1416,8 +1860,7 @@ pub fn translate(
         if node["isImplicit"].as_bool() == Some(true) {
             continue;
         }
-        let location = expansion_location(&node["loc"]);
-        if let Some(file) = location["file"].as_str() {
+        if let Some(file) = file_from_loc(&node["loc"]) {
             current_file = Path::new(file).to_path_buf();
         }
         let physical_file = current_file.canonicalize()?;
@@ -1426,16 +1869,27 @@ pub fn translate(
         if !in_project {
             if kind(node) == "FunctionDecl"
                 && !children(node).iter().any(|n| kind(n) == "CompoundStmt")
-                && !node["variadic"].as_bool().unwrap_or(false)
             {
                 let name = text(node, "name");
-                if identifier(name).is_ok()
-                    && let Ok((param_types, ret_type)) =
-                        parse_fn_signature(text(&node["type"], "qualType"), &typedefs)
-                {
-                    prototypes
-                        .entry(name.to_owned())
-                        .or_insert_with(|| make_external_function(name, &param_types, &ret_type));
+                if identifier(name).is_ok() {
+                    if node["variadic"].as_bool().unwrap_or(false) {
+                        variadic_prototypes.insert(name.to_owned());
+                    } else {
+                        match parse_fn_signature(text(&node["type"], "qualType"), &typedefs) {
+                            Ok((param_types, ret_type)) => {
+                                variadic_prototypes.remove(name);
+                                unsupported_prototypes.remove(name);
+                                prototypes.entry(name.to_owned()).or_insert_with(|| {
+                                    make_external_function(name, &param_types, &ret_type)
+                                });
+                            }
+                            Err(err) => {
+                                unsupported_prototypes
+                                    .entry(name.to_owned())
+                                    .or_insert_with(|| err.to_string());
+                            }
+                        }
+                    }
                 }
             }
             continue;
@@ -1446,37 +1900,75 @@ pub fn translate(
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("non-UTF8 source path"))?;
         match kind(node) {
-            "RecordDecl" | "TypedefDecl" | "EnumDecl" => continue,
+            "RecordDecl" | "TypedefDecl" | "EnumDecl" | "StaticAssertDecl" | "EmptyDecl" => {
+                continue;
+            }
             "VarDecl" => {
                 let gname = text(node, "name");
                 identifier(gname)?;
+                let value_children: Vec<_> = children(node)
+                    .iter()
+                    .filter(|c| !is_benign_attr_or_comment(kind(c)))
+                    .collect();
+                let storage_class = text(node, "storageClass");
+                if storage_class == "extern" && value_children.is_empty() {
+                    if is_const_qualified(&node["type"])
+                        && let Ok(gty) = CType::from_node_type(&node["type"], &typedefs)
+                        && !matches!(gty, CType::Void | CType::Array(_, 0))
+                    {
+                        let rust_name = format!("RF_EXTERN_{gname}");
+                        let rty = gty.rust_type();
+                        constants.push(format!(
+                            "unsafe extern \"C\" {{\n    #[link_name = \"{gname}\"]\n    pub static {rust_name}: {rty};\n}}\n"
+                        ));
+                        const_globals.insert(text(node, "id").to_owned(), (rust_name, gty, false));
+                    } else {
+                        unsupported_globals.insert(
+                            text(node, "id").to_owned(),
+                            format!("external global {gname} is unsupported"),
+                        );
+                    }
+                    continue;
+                }
                 ensure!(
                     is_const_qualified(&node["type"]),
                     "mutable global variable {gname} is unsupported"
                 );
                 ensure!(
-                    children(node).len() == 1,
+                    value_children.len() == 1,
                     "const global {gname} must have an initializer"
                 );
                 let gty = CType::from_node_type(&node["type"], &typedefs)?;
+                let cur_clang_str = current_file.to_string_lossy().into_owned();
                 let mut temp_deps = prototypes.clone();
                 let mut temp_emitter = Emitter {
                     variables: BTreeMap::new(),
                     uninit_scalars: BTreeSet::new(),
-                    const_globals: &const_globals,
+                    const_globals: Cow::Borrowed(&const_globals),
+                    unsupported_globals: Cow::Borrowed(&unsupported_globals),
+                    variadic_prototypes: &variadic_prototypes,
+                    unsupported_prototypes: &unsupported_prototypes,
                     dependencies: BTreeSet::new(),
                     next_variable: 0,
                     loop_labels: Vec::new(),
                     break_target: Vec::new(),
                     forward_labels: BTreeMap::new(),
                     return_type: CType::Void,
-                    typedefs: &typedefs,
-                    enum_constants: &enum_constants,
-                    structs: &structs_map,
-                    unions: &unions_map,
+                    typedefs: Cow::Borrowed(&typedefs),
+                    enum_constants: Cow::Borrowed(&enum_constants),
+                    structs: Cow::Borrowed(&structs_map),
+                    unions: Cow::Borrowed(&unions_map),
+                    structs_out: &mut structs,
+                    seen_records: &mut seen_records,
+                    anon_counter: &mut anon_counter,
+                    file_sources: &mut file_sources,
+                    current_rel_file: file,
+                    current_physical_file: &physical_file,
+                    current_clang_file: &cur_clang_str,
+                    current_source: "",
                     prototypes: &mut temp_deps,
                 };
-                let (init_expr, init_ty) = temp_emitter.typed_expression(&children(node)[0])?;
+                let (init_expr, init_ty) = temp_emitter.typed_expression(value_children[0])?;
                 ensure!(
                     gty.same_shape(&init_ty),
                     "const global {gname} initializer type mismatch"
@@ -1500,17 +1992,67 @@ pub fn translate(
 
         let name = text(node, "name");
         identifier(name)?;
-        ensure!(
-            !node["variadic"].as_bool().unwrap_or(false),
-            "variadic functions are unsupported"
-        );
         let storage_class = text(node, "storageClass");
         ensure!(
             matches!(storage_class, "" | "static" | "extern"),
             "unsupported function storage class"
         );
         let is_static = storage_class == "static";
+        let body = children(node).iter().find(|n| kind(n) == "CompoundStmt");
 
+        if body.is_none() {
+            if node["variadic"].as_bool().unwrap_or(false) {
+                variadic_prototypes.insert(name.to_owned());
+                continue;
+            }
+            let parse_proto = || -> Result<(Vec<CType>, CType)> {
+                let params: Vec<_> = children(node)
+                    .iter()
+                    .filter(|n| kind(n) == "ParmVarDecl")
+                    .collect();
+                let mut param_ctypes = Vec::with_capacity(params.len());
+                for param in &params {
+                    let pty = CType::from_node_type(&param["type"], &typedefs)?;
+                    ensure!(
+                        !matches!(pty, CType::Void),
+                        "void parameter type unsupported"
+                    );
+                    param_ctypes.push(pty);
+                }
+                let (sig_params, return_ctype) =
+                    parse_fn_signature(text(&node["type"], "qualType"), &typedefs)?;
+                ensure!(
+                    sig_params.len() == param_ctypes.len()
+                        && sig_params
+                            .iter()
+                            .zip(&param_ctypes)
+                            .all(|(a, b)| a.same_shape(b)),
+                    "unsupported function type {}",
+                    text(&node["type"], "qualType")
+                );
+                Ok((param_ctypes, return_ctype))
+            };
+            match parse_proto() {
+                Ok((param_ctypes, return_ctype)) => {
+                    variadic_prototypes.remove(name);
+                    unsupported_prototypes.remove(name);
+                    prototypes.entry(name.to_owned()).or_insert_with(|| {
+                        make_external_function(name, &param_ctypes, &return_ctype)
+                    });
+                }
+                Err(err) => {
+                    unsupported_prototypes
+                        .entry(name.to_owned())
+                        .or_insert_with(|| err.to_string());
+                }
+            }
+            continue;
+        }
+
+        ensure!(
+            !node["variadic"].as_bool().unwrap_or(false),
+            "variadic functions are unsupported"
+        );
         let params: Vec<_> = children(node)
             .iter()
             .filter(|n| kind(n) == "ParmVarDecl")
@@ -1536,13 +2078,7 @@ pub fn translate(
             text(&node["type"], "qualType")
         );
 
-        let Some(body) = children(node).iter().find(|n| kind(n) == "CompoundStmt") else {
-            prototypes
-                .entry(name.to_owned())
-                .or_insert_with(|| make_external_function(name, &param_ctypes, &return_ctype));
-            continue;
-        };
-
+        let body = body.expect("checked above");
         ensure!(
             name != "main",
             "main functions are not supported; select a library entry function"
@@ -1551,29 +2087,43 @@ pub fn translate(
             children(node)
                 .iter()
                 .all(|n| matches!(kind(n), "ParmVarDecl" | "CompoundStmt")
-                    || (matches!(
-                        kind(n),
-                        "BuiltinAttr" | "NoThrowAttr" | "ConstAttr" | "PureAttr"
-                    ) && (n["inherited"].as_bool() == Some(true)
-                        || n["implicit"].as_bool() == Some(true)))),
+                    || is_benign_attr_or_comment(kind(n))),
             "function attributes or other declarations are unsupported"
         );
 
-        let source = std::fs::read_to_string(&physical_file)?;
+        let source = if let Some(s) = file_sources.get(file) {
+            s.clone()
+        } else {
+            let s = std::fs::read_to_string(&physical_file)?;
+            file_sources.insert(file.to_owned(), s.clone());
+            s
+        };
+        let cur_clang_str = current_file.to_string_lossy().into_owned();
         let mut emitter = Emitter {
             variables: BTreeMap::new(),
             uninit_scalars: BTreeSet::new(),
-            const_globals: &const_globals,
+            const_globals: Cow::Borrowed(&const_globals),
+            unsupported_globals: Cow::Borrowed(&unsupported_globals),
+            variadic_prototypes: &variadic_prototypes,
+            unsupported_prototypes: &unsupported_prototypes,
             dependencies: BTreeSet::new(),
             next_variable: 0,
             loop_labels: Vec::new(),
             break_target: Vec::new(),
             forward_labels: BTreeMap::new(),
             return_type: return_ctype.clone(),
-            typedefs: &typedefs,
-            enum_constants: &enum_constants,
-            structs: &structs_map,
-            unions: &unions_map,
+            typedefs: Cow::Borrowed(&typedefs),
+            enum_constants: Cow::Borrowed(&enum_constants),
+            structs: Cow::Borrowed(&structs_map),
+            unions: Cow::Borrowed(&unions_map),
+            structs_out: &mut structs,
+            seen_records: &mut seen_records,
+            anon_counter: &mut anon_counter,
+            file_sources: &mut file_sources,
+            current_rel_file: file,
+            current_physical_file: &physical_file,
+            current_clang_file: &cur_clang_str,
+            current_source: &source,
             prototypes: &mut prototypes,
         };
         let mut parameters = Vec::new();
@@ -1648,12 +2198,79 @@ pub fn translate(
         });
     }
 
+    let defined_names: BTreeSet<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+    prototypes.retain(|name, _| !defined_names.contains(name.as_str()));
+
+    let mut used_struct_tags = BTreeSet::new();
+    let mut used_union_tags = BTreeSet::new();
+    let scan_all = |code: &str, st: &mut BTreeSet<String>, un: &mut BTreeSet<String>| {
+        scan_record_prefixes(code, "RfStruct_", st);
+        scan_record_prefixes(code, "RfUnion_", un);
+    };
+    for s in &structs {
+        scan_all(&s.rust, &mut used_struct_tags, &mut used_union_tags);
+    }
+    for c in &constants {
+        scan_all(c, &mut used_struct_tags, &mut used_union_tags);
+    }
+    for f in &functions {
+        scan_all(&f.rust, &mut used_struct_tags, &mut used_union_tags);
+    }
+    for p in prototypes.values() {
+        scan_all(&p.rust, &mut used_struct_tags, &mut used_union_tags);
+    }
+    for tag in used_struct_tags {
+        if !seen_records.contains(&format!("struct:{tag}")) && identifier(&tag).is_ok() {
+            structs.push(StructDef {
+                name: tag.clone(),
+                rust_name: format!("RfStruct_{tag}"),
+                fields: Vec::new(),
+                source_file: translation_unit.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: 1,
+                rust: format!(
+                    "#[repr(C)]\n#[derive(Clone, Copy, Debug, Default)]\npub struct RfStruct_{tag} {{\n    _private: [u8; 0],\n}}\n"
+                ),
+            });
+        }
+    }
+    for tag in used_union_tags {
+        if !seen_records.contains(&format!("union:{tag}")) && identifier(&tag).is_ok() {
+            structs.push(StructDef {
+                name: format!("union:{tag}"),
+                rust_name: format!("RfUnion_{tag}"),
+                fields: Vec::new(),
+                source_file: translation_unit.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: 1,
+                rust: format!(
+                    "#[repr(C)]\n#[derive(Clone, Copy, Debug, Default)]\npub struct RfUnion_{tag} {{\n    _private: [u8; 0],\n}}\n"
+                ),
+            });
+        }
+    }
+
     Ok(TranslationUnitOutput {
         structs,
         constants,
         functions,
         prototypes: prototypes.into_values().collect(),
     })
+}
+
+fn scan_record_prefixes(code: &str, prefix: &str, out: &mut BTreeSet<String>) {
+    let mut rest = code;
+    while let Some(pos) = rest.find(prefix) {
+        let after = &rest[pos + prefix.len()..];
+        let len = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if len > 0 {
+            out.insert(after[..len].to_owned());
+        }
+        rest = &after[len..];
+    }
 }
 
 enum SwitchLabel<'a> {
@@ -1701,17 +2318,28 @@ fn flatten_switch_node<'a>(
 struct Emitter<'a> {
     variables: BTreeMap<String, (String, CType)>,
     uninit_scalars: BTreeSet<String>,
-    const_globals: &'a BTreeMap<String, (String, CType, bool)>,
+    const_globals: Cow<'a, BTreeMap<String, (String, CType, bool)>>,
+    unsupported_globals: Cow<'a, BTreeMap<String, String>>,
+    variadic_prototypes: &'a BTreeSet<String>,
+    unsupported_prototypes: &'a BTreeMap<String, String>,
     dependencies: BTreeSet<String>,
     next_variable: usize,
     loop_labels: Vec<String>,
     break_target: Vec<Option<String>>,
     forward_labels: BTreeMap<String, String>,
     return_type: CType,
-    typedefs: &'a BTreeMap<String, String>,
-    enum_constants: &'a BTreeMap<String, (i64, IntKind)>,
-    structs: &'a StructFieldsMap,
-    unions: &'a UnionFieldsMap,
+    typedefs: Cow<'a, BTreeMap<String, String>>,
+    enum_constants: Cow<'a, BTreeMap<String, (i64, IntKind)>>,
+    structs: Cow<'a, StructFieldsMap>,
+    unions: Cow<'a, UnionFieldsMap>,
+    structs_out: &'a mut Vec<StructDef>,
+    seen_records: &'a mut BTreeSet<String>,
+    anon_counter: &'a mut usize,
+    file_sources: &'a mut BTreeMap<String, String>,
+    current_rel_file: &'a str,
+    current_physical_file: &'a Path,
+    current_clang_file: &'a str,
+    current_source: &'a str,
     prototypes: &'a mut BTreeMap<String, ExternalFunction>,
 }
 
@@ -1737,6 +2365,9 @@ impl Emitter<'_> {
         }
         if let Some((name, ty, _)) = self.const_globals.get(id) {
             return Ok((name.clone(), ty.clone()));
+        }
+        if let Some(reason) = self.unsupported_globals.get(id) {
+            bail!("{reason}");
         }
         bail!("unknown or nonlocal variable")
     }
@@ -1769,6 +2400,181 @@ impl Emitter<'_> {
         }
     }
 
+    fn resolve_member_name(
+        &self,
+        base_ty: &CType,
+        raw_field: &str,
+        node: &Value,
+    ) -> Result<(String, CType)> {
+        if !raw_field.is_empty() {
+            identifier(raw_field)?;
+            let fty = self.member_type(base_ty, raw_field)?;
+            return Ok((rust_field_name(raw_field), fty));
+        }
+        let target_ty = CType::from_node_type(&node["type"], &self.typedefs)?;
+        match base_ty {
+            CType::Struct(sname) => {
+                let fields = self
+                    .structs
+                    .get(sname)
+                    .with_context(|| format!("unknown struct {sname}"))?;
+                fields
+                    .iter()
+                    .find(|(n, ty, _)| n.starts_with("rf_anon_") && ty.same_shape(&target_ty))
+                    .map(|(n, ty, _)| (rust_field_name(n), ty.clone()))
+                    .with_context(|| format!("anonymous member not found on struct {sname}"))
+            }
+            CType::Union(uname) => {
+                let fields = self
+                    .unions
+                    .get(uname)
+                    .with_context(|| format!("unknown union {uname}"))?;
+                fields
+                    .iter()
+                    .find(|(n, ty)| n.starts_with("rf_anon_") && ty.same_shape(&target_ty))
+                    .map(|(n, ty)| (rust_field_name(n), ty.clone()))
+                    .with_context(|| format!("anonymous member not found on union {uname}"))
+            }
+            _ => bail!("member access requires struct or union"),
+        }
+    }
+
+    fn handle_non_var_local_decl(&mut self, declaration: &Value) -> Result<bool> {
+        match kind(declaration) {
+            "EnumDecl" => {
+                let typedefs_snapshot = self.typedefs.clone();
+                collect_enum_decl(
+                    declaration,
+                    typedefs_snapshot.as_ref(),
+                    self.enum_constants.to_mut(),
+                );
+                Ok(true)
+            }
+            "TypedefDecl" => {
+                let td_name = text(declaration, "name");
+                let underlying = text(&declaration["type"], "qualType");
+                if !td_name.is_empty()
+                    && !underlying.is_empty()
+                    && !underlying.contains("unnamed")
+                    && !underlying.contains("anonymous")
+                {
+                    self.typedefs
+                        .to_mut()
+                        .insert(td_name.to_owned(), underlying.to_owned());
+                }
+                Ok(true)
+            }
+            "FunctionDecl"
+                if !children(declaration)
+                    .iter()
+                    .any(|c| kind(c) == "CompoundStmt") =>
+            {
+                let name = text(declaration, "name");
+                identifier(name)?;
+                Ok(true)
+            }
+            "RecordDecl" => {
+                if declaration["completeDefinition"].as_bool() != Some(true) {
+                    return Ok(true);
+                }
+                let empty_anon = BTreeMap::new();
+                let mut entries = Vec::new();
+                collect_nested_records(
+                    declaration,
+                    self.current_rel_file,
+                    self.current_physical_file,
+                    self.current_clang_file,
+                    &empty_anon,
+                    self.anon_counter,
+                    self.typedefs.to_mut(),
+                    self.file_sources,
+                    &mut entries,
+                )?;
+                for entry in entries {
+                    emit_record_entry(
+                        entry.node,
+                        entry.name,
+                        entry.rel_file,
+                        self.current_source,
+                        true,
+                        self.anon_counter,
+                        self.typedefs.to_mut(),
+                        self.enum_constants.to_mut(),
+                        self.structs.to_mut(),
+                        self.unions.to_mut(),
+                        self.seen_records,
+                        self.structs_out,
+                    )?;
+                }
+                Ok(true)
+            }
+            "StaticAssertDecl" => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    fn try_static_or_extern_local(&mut self, declaration: &Value) -> Result<Option<String>> {
+        let storage_class = text(declaration, "storageClass");
+        if storage_class.is_empty() {
+            return Ok(None);
+        }
+        let decl_id = text(declaration, "id").to_owned();
+        if storage_class == "extern" {
+            let init = local_initializer(declaration)?;
+            ensure!(init.is_none(), "extern local cannot have initializer");
+            let gname = text(declaration, "name");
+            identifier(gname)?;
+            if is_const_qualified(&declaration["type"])
+                && let Ok(gty) = CType::from_node_type(&declaration["type"], &self.typedefs)
+                && !matches!(gty, CType::Void | CType::Array(_, 0))
+            {
+                let rust_name = self.fresh_var("RF_EXTERN_");
+                let rty = gty.rust_type();
+                let is_array = matches!(gty, CType::Array(..));
+                self.const_globals
+                    .to_mut()
+                    .insert(decl_id, (rust_name.clone(), gty, is_array));
+                return Ok(Some(format!(
+                    "unsafe extern \"C\" {{\n    #[link_name = \"{gname}\"]\n    static {rust_name}: {rty};\n}}"
+                )));
+            }
+            self.unsupported_globals
+                .to_mut()
+                .insert(decl_id, format!("external global {gname} is unsupported"));
+            return Ok(Some(String::new()));
+        }
+        ensure!(
+            storage_class == "static" && is_const_qualified(&declaration["type"]),
+            "static/extern locals unsupported"
+        );
+        let var_ty = CType::from_node_type(&declaration["type"], &self.typedefs)?;
+        ensure!(
+            !matches!(var_ty, CType::Void),
+            "void local variable unsupported"
+        );
+        let name = self.fresh_var("RF_STATIC_");
+        let rust_ty = var_ty.rust_type();
+        let val = if let Some(init_node) = local_initializer(declaration)? {
+            let (v, vty) = self.typed_expression(init_node)?;
+            ensure!(var_ty.same_shape(&vty), "local initializer type mismatch");
+            v
+        } else {
+            var_ty.zero_expr(&self.structs)?
+        };
+        let is_static = matches!(var_ty, CType::Array(..))
+            && !var_ty.contains_raw_ptr(&self.structs, &self.unions);
+        let kw = if is_static { "static" } else { "const" };
+        let val_block = if is_static {
+            format!("unsafe {{ {val} }}")
+        } else {
+            val
+        };
+        self.const_globals
+            .to_mut()
+            .insert(decl_id, (name.clone(), var_ty, is_static));
+        Ok(Some(format!("{kw} {name}: {rust_ty} = {val_block};")))
+    }
+
     fn lvalue_bitfield(&self, mut node: &Value) -> Option<(IntKind, u32)> {
         while kind(node) == "ParenExpr" {
             node = children(node).first()?;
@@ -1777,8 +2583,11 @@ impl Emitter<'_> {
             return None;
         }
         let field = text(node, "name");
+        if field.is_empty() {
+            return None;
+        }
         let inner = children(node).first()?;
-        let base_ty = CType::from_node_type(&inner["type"], self.typedefs).ok()?;
+        let base_ty = CType::from_node_type(&inner["type"], &self.typedefs).ok()?;
         let sname = if node["isArrow"].as_bool().unwrap_or(false) {
             match base_ty {
                 CType::Ptr { inner, .. } => match *inner {
@@ -1824,20 +2633,19 @@ impl Emitter<'_> {
             }
             "MemberExpr" => {
                 ensure!(inner.len() == 1, "invalid member expression");
-                let field = text(node, "name");
-                identifier(field)?;
+                let raw_field = text(node, "name");
                 if node["isArrow"].as_bool().unwrap_or(false) {
                     let (ptr, ty) = self.typed_expression(&inner[0])?;
                     match ty {
                         CType::Ptr { inner, .. } => {
-                            let fty = self.member_type(&inner, field)?;
+                            let (field, fty) = self.resolve_member_name(&inner, raw_field, node)?;
                             Ok((format!("(*rf_ptr({ptr})).{field}"), fty))
                         }
                         _ => bail!("arrow member access requires pointer"),
                     }
                 } else {
                     let (base, ty) = self.lvalue(&inner[0])?;
-                    let fty = self.member_type(&ty, field)?;
+                    let (field, fty) = self.resolve_member_name(&ty, raw_field, node)?;
                     Ok((format!("({base}).{field}"), fty))
                 }
             }
@@ -1905,7 +2713,7 @@ impl Emitter<'_> {
                     "checked_shr"
                 };
                 format!(
-                    "({{ let rf_l = {left}; let rf_r = {right}; u32::try_from(rf_r).ok().and_then(|s| rf_l.{method}(s)).expect(\"undefined C shift\") }})"
+                    "({{ let rf_l = {left}; let rf_r = {right}; let rf_s = rf_r as i128; if rf_s < 0 || rf_s > (u32::MAX as i128) {{ panic!(\"undefined C shift\"); }} rf_l.{method}(rf_s as u32).expect(\"undefined C shift\") }})"
                 )
             }
             "&" | "|" | "^" => format!("(({left}) {op} ({right}))"),
@@ -1936,12 +2744,13 @@ impl Emitter<'_> {
                         );
                         e
                     } else {
-                        fty.zero_expr(self.structs)?
+                        fty.zero_expr(&self.structs)?
                     };
                     if let (Some(w), CType::Int(ik)) = (bitwidth, fty) {
                         init_expr = normalize_bitfield(&init_expr, *ik, *w);
                     }
-                    field_inits.push(format!("{fname}: {init_expr}"));
+                    let rf_fname = rust_field_name(fname);
+                    field_inits.push(format!("{rf_fname}: {init_expr}"));
                 }
                 Ok(format!("RfStruct_{sname} {{ {} }}", field_inits.join(", ")))
             }
@@ -1953,7 +2762,9 @@ impl Emitter<'_> {
                     .clone();
                 let inner = children(node);
                 if inner.is_empty() || kind(&inner[0]) == "ImplicitValueInitExpr" {
-                    return Ok(format!("core::mem::zeroed::<RfUnion_{uname}>()"));
+                    return Ok(format!(
+                        "unsafe {{ core::mem::zeroed::<RfUnion_{uname}>() }}"
+                    ));
                 }
                 let active_field_name = node["field"]["name"].as_str();
                 let (fname, fty) = if let Some(target) = active_field_name {
@@ -1973,21 +2784,24 @@ impl Emitter<'_> {
                     val_ty.same_shape(&fty),
                     "union initializer type mismatch on {uname}.{fname}"
                 );
+                let rf_fname = rust_field_name(&fname);
                 let u_var = self.fresh_var("rf_u");
                 Ok(format!(
-                    "{{ let mut {u_var}: RfUnion_{uname} = core::mem::zeroed(); {u_var}.{fname} = {val_expr}; {u_var} }}"
+                    "unsafe {{ let mut {u_var}: RfUnion_{uname} = core::mem::zeroed(); {u_var}.{rf_fname} = {val_expr}; {u_var} }}"
                 ))
             }
             CType::Array(elem_ty, len) => {
                 let inner = children(node);
                 if inner.len() == 1
                     && kind(&inner[0]) == "StringLiteral"
-                    && matches!(
-                        **elem_ty,
-                        CType::Int(IntKind::Char | IntKind::I8 | IntKind::U8)
-                    )
+                    && let CType::Int(elem_ik @ (IntKind::Char | IntKind::I8 | IntKind::U8)) =
+                        **elem_ty
                 {
-                    return format_string_literal_array(text(&inner[0], "value"), Some(*len));
+                    return format_string_literal_array(
+                        text(&inner[0], "value"),
+                        Some(*len),
+                        elem_ik,
+                    );
                 }
                 let mut elem_exprs = Vec::with_capacity(*len);
                 if let Some(filler_arr) = node["array_filler"].as_array()
@@ -2016,14 +2830,30 @@ impl Emitter<'_> {
                             );
                             e
                         } else {
-                            elem_ty.zero_expr(self.structs)?
+                            elem_ty.zero_expr(&self.structs)?
                         };
                         elem_exprs.push(e);
                     }
                 }
                 Ok(format!("[{}]", elem_exprs.join(", ")))
             }
-            _ => bail!("initializer list only supported for struct, union, and array types"),
+            _ if is_scalar_type(ty) => {
+                let inner = children(node);
+                if inner.is_empty() || kind(&inner[0]) == "ImplicitValueInitExpr" {
+                    ty.zero_expr(&self.structs)
+                } else {
+                    ensure!(
+                        inner.len() == 1,
+                        "scalar initializer list must have at most 1 element"
+                    );
+                    let (e, ety) = self.typed_expression(&inner[0])?;
+                    ensure!(ety.same_shape(ty), "scalar initializer list type mismatch");
+                    Ok(e)
+                }
+            }
+            _ => {
+                bail!("initializer list only supported for struct, union, array, and scalar types")
+            }
         }
     }
 
@@ -2034,14 +2864,14 @@ impl Emitter<'_> {
             ensure!(inner.len() == 1, "invalid parenthesized sizeof operand");
             cur = &inner[0];
         }
-        CType::from_node_type(&cur["type"], self.typedefs)
+        CType::from_node_type(&cur["type"], &self.typedefs)
     }
 
     fn typed_expression(&mut self, node: &Value) -> Result<(String, CType)> {
         let inner = children(node);
         match kind(node) {
             "IntegerLiteral" => {
-                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                 let CType::Int(ik) = ty else {
                     bail!("non-int integer literal");
                 };
@@ -2056,7 +2886,7 @@ impl Emitter<'_> {
                 Ok((formatted, ty))
             }
             "FloatingLiteral" => {
-                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                 let CType::Float(fk) = ty else {
                     bail!("non-float floating literal");
                 };
@@ -2098,29 +2928,63 @@ impl Emitter<'_> {
                 Ok((formatted, ty))
             }
             "CharacterLiteral" => {
-                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                 let CType::Int(ik) = ty else {
                     bail!("non-int character literal");
                 };
-                let val = node["value"]
-                    .as_i64()
+                let raw_val = node["value"]
+                    .as_u64()
+                    .map(|v| v as u128)
+                    .or_else(|| node["value"].as_i64().map(|v| v as u64 as u128))
                     .context("missing character literal value")?;
-                Ok((format!("{val}{}", ik.rust_type()), ty))
-            }
-            "StringLiteral" => {
-                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
-                let expected_len = match &ty {
-                    CType::Array(_, len) => Some(*len),
-                    _ => None,
+                let rty = ik.rust_type();
+                let expr = if raw_val <= 0x7f {
+                    format!("{raw_val}{rty}")
+                } else {
+                    let uty = ik.unsigned_rust_type();
+                    format!("(({raw_val}_u64 as {uty}) as {rty})")
                 };
-                let expr = format_string_literal_array(text(node, "value"), expected_len)?;
                 Ok((expr, ty))
             }
+            "StringLiteral" => {
+                let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
+                let (expected_len, elem_ik) = match &ty {
+                    CType::Array(elem, len) => {
+                        let ik = match **elem {
+                            CType::Int(k) => k,
+                            _ => IntKind::Char,
+                        };
+                        (Some(*len), ik)
+                    }
+                    _ => (None, IntKind::Char),
+                };
+                let expr = format_string_literal_array(text(node, "value"), expected_len, elem_ik)?;
+                Ok((expr, ty))
+            }
+            "PredefinedExpr" => {
+                ensure!(inner.len() == 1, "invalid PredefinedExpr");
+                self.typed_expression(&inner[0])
+            }
             "ConstantExpr" => {
+                if let Some(raw) = node["value"].as_str()
+                    && let Ok(ty) = CType::from_node_type(&node["type"], &self.typedefs)
+                    && let CType::Int(ik) = ty
+                {
+                    if ik.is_signed()
+                        && let Ok(val) = raw.parse::<i128>()
+                    {
+                        return Ok((format!("{val}{}", ik.rust_type()), ty));
+                    }
+                    if !ik.is_signed()
+                        && let Ok(val) = raw.parse::<u128>()
+                    {
+                        return Ok((format!("{val}{}", ik.rust_type()), ty));
+                    }
+                }
                 if let Some(first) = inner.first() {
                     self.typed_expression(first)
                 } else {
-                    let ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                    let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                     let CType::Int(ik) = ty else {
                         bail!("unsupported ConstantExpr");
                     };
@@ -2144,8 +3008,17 @@ impl Emitter<'_> {
                     "FunctionDecl" => {
                         let name = text(ref_decl, "name");
                         identifier(name)?;
-                        let (param_types, ret_type) =
-                            parse_fn_signature(text(&ref_decl["type"], "qualType"), self.typedefs)?;
+                        ensure!(
+                            !self.variadic_prototypes.contains(name),
+                            "variadic functions are unsupported"
+                        );
+                        if let Some(reason) = self.unsupported_prototypes.get(name) {
+                            bail!("{reason}");
+                        }
+                        let (param_types, ret_type) = parse_fn_signature(
+                            text(&ref_decl["type"], "qualType"),
+                            &self.typedefs,
+                        )?;
                         self.dependencies.insert(name.into());
                         self.prototypes.entry(name.to_owned()).or_insert_with(|| {
                             make_external_function(name, &param_types, &ret_type)
@@ -2166,10 +3039,9 @@ impl Emitter<'_> {
                 if node["isArrow"].as_bool().unwrap_or(false) {
                     self.lvalue(node)
                 } else {
-                    let field = text(node, "name");
-                    identifier(field)?;
+                    let raw_field = text(node, "name");
                     let (base, ty) = self.typed_expression(&inner[0])?;
-                    let fty = self.member_type(&ty, field)?;
+                    let (field, fty) = self.resolve_member_name(&ty, raw_field, node)?;
                     Ok((format!("({base}).{field}"), fty))
                 }
             }
@@ -2179,12 +3051,12 @@ impl Emitter<'_> {
                 Ok((format!("({expr})"), ty))
             }
             "ImplicitValueInitExpr" => {
-                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
-                let z = ty.zero_expr(self.structs)?;
+                let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
+                let z = ty.zero_expr(&self.structs)?;
                 Ok((z, ty))
             }
             "InitListExpr" => {
-                let ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                 let expr = self.emit_init_list(node, &ty)?;
                 Ok((expr, ty))
             }
@@ -2192,16 +3064,43 @@ impl Emitter<'_> {
                 ensure!(inner.len() == 1, "invalid compound literal");
                 self.typed_expression(&inner[0])
             }
+            "StmtExpr" => {
+                ensure!(
+                    inner.len() == 1 && kind(&inner[0]) == "CompoundStmt",
+                    "invalid statement expression"
+                );
+                let target_ty = CType::from_node_type(&node["type"], &self.typedefs)?;
+                let stmts = children(&inner[0]);
+                ensure!(
+                    !stmts.iter().any(|s| kind(s) == "LabelStmt"),
+                    "labels inside statement expression are unsupported"
+                );
+                if matches!(target_ty, CType::Void) || stmts.is_empty() {
+                    let block = self.statement(&inner[0])?;
+                    return Ok((block, CType::Void));
+                }
+                let mut lines = Vec::with_capacity(stmts.len());
+                for stmt in &stmts[..stmts.len() - 1] {
+                    lines.push(self.statement(stmt)?);
+                }
+                let (tail_expr, tail_ty) = self.typed_expression(&stmts[stmts.len() - 1])?;
+                ensure!(
+                    tail_ty.same_shape(&target_ty),
+                    "statement expression result type mismatch"
+                );
+                lines.push(tail_expr);
+                Ok((format!("{{\n{}\n}}", lines.join("\n")), target_ty))
+            }
             "UnaryExprOrTypeTraitExpr" => {
                 let trait_name = text(node, "name");
                 let mem_fn = match trait_name {
                     "sizeof" => "size_of",
-                    "alignof" | "_Alignof" => "align_of",
+                    "alignof" | "_Alignof" | "__alignof" | "__alignof__" => "align_of",
                     other => bail!("unsupported type trait {other}"),
                 };
-                let result_ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let result_ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                 let target_ty = if node.get("argType").is_some() {
-                    CType::from_node_type(&node["argType"], self.typedefs)?
+                    CType::from_node_type(&node["argType"], &self.typedefs)?
                 } else {
                     ensure!(inner.len() == 1, "invalid {trait_name} operand");
                     self.sizeof_node_type(&inner[0])?
@@ -2217,7 +3116,7 @@ impl Emitter<'_> {
             }
             "ImplicitCastExpr" | "CStyleCastExpr" => {
                 ensure!(inner.len() == 1, "invalid cast expression");
-                let target_ty = CType::from_node_type(&node["type"], self.typedefs)?;
+                let target_ty = CType::from_node_type(&node["type"], &self.typedefs)?;
                 match text(node, "castKind") {
                     "LValueToRValue" | "NoOp" | "FunctionToPointerDecay" => {
                         let (expr, inner_ty) = self.typed_expression(&inner[0])?;
@@ -2228,11 +3127,47 @@ impl Emitter<'_> {
                         Ok((expr, target_ty))
                     }
                     "ArrayToPointerDecay" => {
-                        if kind(&inner[0]) == "StringLiteral" {
-                            let char_rty = IntKind::Char.rust_type();
-                            let arr = format_string_literal_array(text(&inner[0], "value"), None)?;
+                        let str_node = if kind(&inner[0]) == "PredefinedExpr" {
+                            children(&inner[0]).first().unwrap_or(&inner[0])
+                        } else {
+                            &inner[0]
+                        };
+                        if kind(str_node) == "StringLiteral" {
+                            let elem_ik = match &target_ty {
+                                CType::Ptr { inner, .. } => match **inner {
+                                    CType::Int(k) => k,
+                                    _ => IntKind::Char,
+                                },
+                                _ => IntKind::Char,
+                            };
+                            let elem_rty = elem_ik.rust_type();
+                            let arr = format_string_literal_array(
+                                text(str_node, "value"),
+                                None,
+                                elem_ik,
+                            )?;
                             return Ok((
-                                format!("((&{arr}).as_ptr() as *mut {char_rty})"),
+                                format!("((&{arr}).as_ptr() as *mut {elem_rty})"),
+                                target_ty,
+                            ));
+                        }
+                        if kind(&inner[0]) == "CompoundLiteralExpr" {
+                            let (arr_expr, arr_ty) = self.typed_expression(&inner[0])?;
+                            let CType::Array(elem_ty, _) = arr_ty else {
+                                bail!("ArrayToPointerDecay requires array operand");
+                            };
+                            ensure!(
+                                target_ty.same_shape(&CType::Ptr {
+                                    inner: elem_ty,
+                                    inner_const: false
+                                }),
+                                "ArrayToPointerDecay type mismatch"
+                            );
+                            let tmp = self.fresh_var("rf_cl");
+                            return Ok((
+                                format!(
+                                    "{{ let mut {tmp} = {arr_expr}; (&mut {tmp}).as_mut_ptr() }}"
+                                ),
                                 target_ty,
                             ));
                         }
@@ -2271,17 +3206,51 @@ impl Emitter<'_> {
                         );
                         Ok((format!("(&mut ({lv})).as_mut_ptr()"), target_ty))
                     }
-                    "NullToPointer" => {
-                        ensure!(
-                            target_ty.is_pointer_like(),
-                            "NullToPointer requires pointer or function pointer type"
-                        );
-                        let null_val = if matches!(target_ty, CType::FnPtr { .. }) {
-                            "None"
-                        } else {
-                            "core::ptr::null_mut()"
+                    "ToVoid" => {
+                        let (expr, _) = self.typed_expression(&inner[0])?;
+                        Ok((format!("{{ let _ = {expr}; }}"), CType::Void))
+                    }
+                    "ToUnion" => {
+                        let (expr, inner_ty) = self.typed_expression(&inner[0])?;
+                        let CType::Union(uname) = &target_ty else {
+                            bail!("ToUnion requires union target type");
                         };
-                        Ok((null_val.into(), target_ty))
+                        let fields = self
+                            .unions
+                            .get(uname)
+                            .with_context(|| format!("unknown union {uname}"))?;
+                        let (fname, _) = fields
+                            .iter()
+                            .find(|(_, fty)| fty.same_shape(&inner_ty))
+                            .with_context(|| {
+                            format!("no matching field in union {uname} for ToUnion cast")
+                        })?;
+                        let rf_fname = rust_field_name(fname);
+                        let u_var = self.fresh_var("rf_u");
+                        Ok((
+                            format!(
+                                "unsafe {{ let mut {u_var}: RfUnion_{uname} = core::mem::zeroed(); {u_var}.{rf_fname} = {expr}; {u_var} }}"
+                            ),
+                            target_ty,
+                        ))
+                    }
+                    "NullToPointer" => {
+                        let null_val = match &target_ty {
+                            CType::FnPtr { .. } => {
+                                let fnty = target_ty.fn_type_only()?;
+                                format!("None::<{fnty}>")
+                            }
+                            CType::Ptr { inner, .. } => {
+                                let pointee = if matches!(**inner, CType::Void) {
+                                    "u8".into()
+                                } else {
+                                    inner.rust_type()
+                                };
+                                format!("core::ptr::null_mut::<{pointee}>()")
+                            }
+                            _ => bail!("NullToPointer requires pointer or function pointer type"),
+                        };
+                        Ok((null_val, target_ty))
                     }
                     "BitCast" => {
                         let (expr, inner_ty) = self.typed_expression(&inner[0])?;
@@ -2290,12 +3259,13 @@ impl Emitter<'_> {
                                 Ok((format!("({expr} as {})", target_ty.rust_type()), target_ty))
                             }
                             (CType::Ptr { .. }, CType::FnPtr { .. }) => {
-                                if expr.trim_matches(|c| c == '(' || c == ')')
-                                    == "core::ptr::null_mut()"
+                                let fnty = target_ty.fn_type_only()?;
+                                let trimmed = expr.trim_matches(|c| c == '(' || c == ')');
+                                if trimmed == "core::ptr::null_mut()"
+                                    || trimmed.starts_with("core::ptr::null_mut::<")
                                 {
-                                    Ok(("None".into(), target_ty))
+                                    Ok((format!("None::<{fnty}>"), target_ty))
                                 } else {
-                                    let fnty = target_ty.fn_type_only()?;
                                     let inner_rust = inner_ty.rust_type();
                                     let tmp = self.fresh_var("rf_fp");
                                     Ok((
@@ -2312,6 +3282,16 @@ impl Emitter<'_> {
                                 Ok((
                                     format!(
                                         "{{ match {expr} {{ Some({tmp}) => ({tmp} as {target_rust}), None => core::ptr::null_mut() }} }}"
+                                    ),
+                                    target_ty,
+                                ))
+                            }
+                            (CType::FnPtr { .. }, CType::FnPtr { .. }) => {
+                                let fnty = target_ty.fn_type_only()?;
+                                let tmp = self.fresh_var("rf_fp");
+                                Ok((
+                                    format!(
+                                        "{{ match {expr} {{ Some({tmp}) => Some(core::mem::transmute::<_, {fnty}>({tmp})), None => None }} }}"
                                     ),
                                     target_ty,
                                 ))
@@ -2402,26 +3382,50 @@ impl Emitter<'_> {
                     "PointerToIntegral" => {
                         let (expr, inner_ty) = self.typed_expression(&inner[0])?;
                         ensure!(
-                            matches!(inner_ty, CType::Ptr { .. })
-                                && matches!(target_ty, CType::Int(_)),
-                            "PointerToIntegral requires pointer source and integer target"
+                            matches!(target_ty, CType::Int(_)),
+                            "PointerToIntegral requires integer target"
                         );
-                        Ok((
-                            format!("(({expr}) as usize as {})", target_ty.rust_type()),
-                            target_ty,
-                        ))
+                        match inner_ty {
+                            CType::Ptr { .. } => Ok((
+                                format!("(({expr}) as usize as {})", target_ty.rust_type()),
+                                target_ty,
+                            )),
+                            CType::FnPtr { .. } => {
+                                let tmp = self.fresh_var("rf_fp");
+                                let rty = target_ty.rust_type();
+                                Ok((
+                                    format!(
+                                        "{{ match {expr} {{ Some({tmp}) => ({tmp} as usize as {rty}), None => (0{rty}) }} }}"
+                                    ),
+                                    target_ty,
+                                ))
+                            }
+                            _ => bail!("PointerToIntegral requires pointer source"),
+                        }
                     }
                     "IntegralToPointer" => {
                         let (expr, inner_ty) = self.typed_expression(&inner[0])?;
                         ensure!(
-                            matches!(inner_ty, CType::Int(_))
-                                && matches!(target_ty, CType::Ptr { .. }),
-                            "IntegralToPointer requires integer source and pointer target"
+                            matches!(inner_ty, CType::Int(_)),
+                            "IntegralToPointer requires integer source"
                         );
-                        Ok((
-                            format!("(({expr}) as usize as {})", target_ty.rust_type()),
-                            target_ty,
-                        ))
+                        match target_ty {
+                            CType::Ptr { .. } => Ok((
+                                format!("(({expr}) as usize as {})", target_ty.rust_type()),
+                                target_ty,
+                            )),
+                            CType::FnPtr { .. } => {
+                                let fnty = target_ty.fn_type_only()?;
+                                let tmp = self.fresh_var("rf_ip");
+                                Ok((
+                                    format!(
+                                        "{{ let {tmp} = ({expr}) as usize; if {tmp} == 0 {{ None }} else {{ Some(core::mem::transmute::<usize, {fnty}>({tmp})) }} }}"
+                                    ),
+                                    target_ty,
+                                ))
+                            }
+                            _ => bail!("IntegralToPointer requires pointer target"),
+                        }
                     }
                     other => bail!("unsupported castKind {other}"),
                 }
@@ -2435,13 +3439,57 @@ impl Emitter<'_> {
                             self.lvalue_bitfield(&inner[0]).is_none(),
                             "cannot take address of bitfield"
                         );
+                        let peeled = unwrap_paren_cast(&inner[0]);
+                        if kind(peeled) == "DeclRefExpr"
+                            && kind(&peeled["referencedDecl"]) == "FunctionDecl"
+                        {
+                            return self.typed_expression(&inner[0]);
+                        }
+                        if kind(peeled) == "CompoundLiteralExpr" {
+                            let (val, val_ty) = self.typed_expression(&inner[0])?;
+                            let rty = val_ty.rust_type();
+                            let tmp = self.fresh_var("rf_cl");
+                            return Ok((
+                                format!(
+                                    "{{ let mut {tmp}: {rty} = {val}; (&mut {tmp} as *mut {rty}) }}"
+                                ),
+                                CType::Ptr {
+                                    inner: Box::new(val_ty),
+                                    inner_const: false,
+                                },
+                            ));
+                        }
                         if let Some(id) = bare_decl_id(&inner[0]) {
                             self.uninit_scalars.remove(id);
                         }
                         let (lv, lv_ty) = self.lvalue(&inner[0])?;
                         let rty = lv_ty.rust_type();
+                        let mut root_lval = peeled;
+                        while matches!(
+                            kind(root_lval),
+                            "MemberExpr"
+                                | "ArraySubscriptExpr"
+                                | "ParenExpr"
+                                | "ImplicitCastExpr"
+                                | "CStyleCastExpr"
+                        ) {
+                            if let Some(first) = children(root_lval).first() {
+                                root_lval = first;
+                            } else {
+                                break;
+                            }
+                        }
+                        let is_const_global = kind(root_lval) == "DeclRefExpr"
+                            && self
+                                .const_globals
+                                .contains_key(text(&root_lval["referencedDecl"], "id"));
+                        let ptr_expr = if is_const_global {
+                            format!("(&({lv}) as *const {rty} as *mut {rty})")
+                        } else {
+                            format!("(&mut ({lv}) as *mut {rty})")
+                        };
                         Ok((
-                            format!("(&mut ({lv}) as *mut {rty})"),
+                            ptr_expr,
                             CType::Ptr {
                                 inner: Box::new(lv_ty),
                                 inner_const: false,
@@ -2746,6 +3794,29 @@ impl Emitter<'_> {
                     then_ty,
                 ))
             }
+            "BinaryConditionalOperator" => {
+                ensure!(inner.len() == 4, "invalid binary conditional expression");
+                let (lhs_expr, lhs_ty) = self.typed_expression(&inner[0])?;
+                let (rhs_expr, rhs_ty) = self.typed_expression(&inner[3])?;
+                ensure!(
+                    lhs_ty.same_shape(&rhs_ty),
+                    "conditional branches must have matching types"
+                );
+                let tmp = self.fresh_var("rf_bc");
+                let cond = match &lhs_ty {
+                    CType::Int(_) => format!("{tmp} != 0"),
+                    CType::Float(_) => format!("{tmp} != 0.0"),
+                    CType::Ptr { .. } => format!("!{tmp}.is_null()"),
+                    CType::FnPtr { .. } => format!("{tmp}.is_some()"),
+                    _ => bail!("unsupported binary conditional operand type"),
+                };
+                Ok((
+                    format!(
+                        "{{ let {tmp} = {lhs_expr}; if {cond} {{ {tmp} }} else {{ {rhs_expr} }} }}"
+                    ),
+                    lhs_ty,
+                ))
+            }
             "CallExpr" => {
                 ensure!(!inner.is_empty(), "invalid function call");
                 let callee = &inner[0];
@@ -2769,8 +3840,15 @@ impl Emitter<'_> {
                             text(&ref_decl["type"], "qualType"),
                         );
                     }
+                    ensure!(
+                        !self.variadic_prototypes.contains(name),
+                        "variadic functions are unsupported"
+                    );
+                    if let Some(reason) = self.unsupported_prototypes.get(name) {
+                        bail!("{reason}");
+                    }
                     let (param_types, ret_type) =
-                        parse_fn_signature(text(&ref_decl["type"], "qualType"), self.typedefs)?;
+                        parse_fn_signature(text(&ref_decl["type"], "qualType"), &self.typedefs)?;
                     ensure!(
                         inner.len() - 1 == param_types.len(),
                         "call to {name} argument count mismatch"
@@ -2879,7 +3957,7 @@ impl Emitter<'_> {
         arg_nodes: &[Value],
         qual_type: &str,
     ) -> Result<(String, CType)> {
-        let generic_ret = CType::from_node_type(&call_node["type"], self.typedefs).ok();
+        let generic_ret = CType::from_node_type(&call_node["type"], &self.typedefs).ok();
         match name {
             "__builtin_add_overflow"
             | "__builtin_sadd_overflow"
@@ -2935,10 +4013,27 @@ impl Emitter<'_> {
                     rt,
                 ));
             }
+            "__builtin_isinf_sign" => {
+                ensure!(arg_nodes.len() == 1, "builtin {name} requires 1 argument");
+                let (expr, ty) = self.typed_expression(&arg_nodes[0])?;
+                ensure!(
+                    matches!(ty, CType::Float(_)),
+                    "builtin {name} requires float or double operand"
+                );
+                let rt = generic_ret.unwrap_or(CType::Int(IntKind::I32));
+                let x = self.fresh_var("rf_inf");
+                let rty = rt.rust_type();
+                return Ok((
+                    format!(
+                        "{{ let {x} = {expr}; (if {x}.is_infinite() {{ if {x}.is_sign_negative() {{ -1i32 }} else {{ 1i32 }} }} else {{ 0i32 }}) as {rty} }}"
+                    ),
+                    rt,
+                ));
+            }
             _ => {}
         }
 
-        let (param_types, ret_type) = parse_fn_signature(qual_type, self.typedefs)?;
+        let (param_types, ret_type) = parse_fn_signature(qual_type, &self.typedefs)?;
         ensure!(
             arg_nodes.len() == param_types.len(),
             "builtin {name} argument count mismatch"
@@ -3167,23 +4262,30 @@ impl Emitter<'_> {
                 if kind(stmt) == "DeclStmt" {
                     let mut init_pairs = Vec::new();
                     for declaration in children(stmt) {
+                        if self.handle_non_var_local_decl(declaration)? {
+                            continue;
+                        }
                         ensure!(
                             kind(declaration) == "VarDecl",
                             "unsupported local declaration"
                         );
-                        let var_ty = CType::from_node_type(&declaration["type"], self.typedefs)?;
+                        if let Some(static_or_extern_stmt) =
+                            self.try_static_or_extern_local(declaration)?
+                        {
+                            if !static_or_extern_stmt.is_empty() {
+                                hoisted.push(static_or_extern_stmt);
+                            }
+                            continue;
+                        }
+                        let var_ty = CType::from_node_type(&declaration["type"], &self.typedefs)?;
                         ensure!(
                             !matches!(var_ty, CType::Void),
                             "void local variable unsupported"
                         );
-                        ensure!(
-                            text(declaration, "storageClass").is_empty(),
-                            "static/extern locals unsupported"
-                        );
                         let decl_id = text(declaration, "id").to_owned();
                         let name = self.fresh_var("v");
                         let rust_ty = var_ty.rust_type();
-                        let zero = var_ty.zero_expr(self.structs)?;
+                        let zero = var_ty.zero_expr(&self.structs)?;
                         self.variables
                             .insert(decl_id.clone(), (name.clone(), var_ty.clone()));
                         hoisted.push(format!("let mut {name}: {rust_ty} = {zero};"));
@@ -3474,18 +4576,25 @@ impl Emitter<'_> {
             "DeclStmt" => {
                 let mut statements = Vec::new();
                 for declaration in inner {
+                    if self.handle_non_var_local_decl(declaration)? {
+                        continue;
+                    }
                     ensure!(
                         kind(declaration) == "VarDecl",
                         "unsupported local declaration"
                     );
-                    let var_ty = CType::from_node_type(&declaration["type"], self.typedefs)?;
+                    if let Some(static_or_extern_stmt) =
+                        self.try_static_or_extern_local(declaration)?
+                    {
+                        if !static_or_extern_stmt.is_empty() {
+                            statements.push(static_or_extern_stmt);
+                        }
+                        continue;
+                    }
+                    let var_ty = CType::from_node_type(&declaration["type"], &self.typedefs)?;
                     ensure!(
                         !matches!(var_ty, CType::Void),
                         "void local variable unsupported"
-                    );
-                    ensure!(
-                        text(declaration, "storageClass").is_empty(),
-                        "static/extern locals unsupported"
                     );
                     let decl_id = text(declaration, "id").to_owned();
                     let name = self.fresh_var("v");
@@ -3498,7 +4607,7 @@ impl Emitter<'_> {
                         );
                         val
                     } else {
-                        let z = var_ty.zero_expr(self.structs)?;
+                        let z = var_ty.zero_expr(&self.structs)?;
                         if is_scalar_type(&var_ty) {
                             self.uninit_scalars.insert(decl_id.clone());
                         }
