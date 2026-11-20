@@ -40,7 +40,8 @@ Source Project ─▶ Clang AST Analysis ─▶ Dependency Plan ─▶ Rust Gene
 | **Planning & Context Inspection** | SCC dependency-ordered translation units, recursive function groups, pointer ownership/mutability inference (`pointer_contracts`), struct/union/constant/extern symbol maps, Kconfig flags, and line-level provenance |
 | **Deterministic Rust Generation** | Signed/unsigned/fixed-width integers, `float`/`double`, enums, `void`, `#[repr(C)]` structs/unions, bitfields, fixed & string-padded char arrays, raw pointers with runtime null checks (`rf_ptr`), `Option<extern "C" fn>` function pointers, `rf_safe_*` safe reference wrappers, `static const` tables, loops, `switch` fallthrough, forward `goto` cleanup labels, definite-init locals, `malloc`/libc/compiler builtins, `rf_abi_*` exports, and kernel `#![no_std]` / `Kbuild` / `rf_port_bindings.h` output |
 | **Agent Candidate Path** | `submit_rust_candidate` persists agent-authored `src/lib.rs` attempts under content hashing and runs the exact same verification gates |
-| **Differential Verification** | C source compiled with `-fsanitize=undefined` and `-lm`, offline dependency-free Cargo build, `#![no_std]` `rlib` build check (`compile-kernel-nostd`), C11 header syntax check (`check-kernel-bindings-header`), bidirectional C↔Rust FFI object linking, and stdout/stderr/exit-code parity comparison |
+| **Differential Verification** | C source compiled with `-fsanitize=undefined` and `-lm`, offline dependency-free Cargo build, `#![no_std]` `rlib` build check (`compile-kernel-nostd`), C11 header syntax check (`check-kernel-bindings-header`), bidirectional C↔Rust FFI object linking, and stdout/stderr/exit-code parity comparison over typed fixtures (64-bit signed/unsigned integers, finite `float`/`double`) |
+| **Verification Input Generation** | `generate_port_cases` compiles the original C with UBSan + SanitizerCoverage (`trace-pc-guard,trace-cmp`) and runs a fork-per-input, coverage-guided search: edge hit-count buckets select the corpus, comparison operands feed a value dictionary, and a greedy set cover plus up to 16 value-diverse clean runs become the cases. Inputs that hit undefined behavior, crashes, or timeouts are reported separately and never handed to `verify_port` (Unix hosts) |
 | **Persistence & Tamper Invalidation** | SQLite job/event store, attempt history across restarts, and automatic `stale` invalidation if source, headers, `.config`, manifests, or candidates change |
 | **Campaign Inventory** | File hashing, build/manifest discovery, paginated inventory inspection, and source context lookup |
 | **Dependency Migration Lifecycle** | Agent-authored dependency contracts & candidates, adapter planning, child sub-campaigns, and JSON execution differential verification |
@@ -65,7 +66,7 @@ Source Project ─▶ Clang AST Analysis ─▶ Dependency Plan ─▶ Rust Gene
 1. `analyze_porting_project({"source_path": "/absolute/path/to/c-project"})`
 2. `create_porting_plan({"job_id": "..."})`
 3. `generate_rust({"job_id": "..."})` for deterministic translation, or inspect `get_porting_context` and submit agent code via `submit_rust_candidate`
-4. `verify_port({"job_id": "...", "entry_function": "score", "cases": [[-7, 3], [0, 0], [200, 10]]})`
+4. `verify_port({"job_id": "...", "entry_function": "score", "cases": [[-7, 3], [0, 0], [200, 10]]})`, or generate inputs first with `generate_port_cases({"job_id": "...", "entry_function": "score"})` and pass `"use_generated_cases": true`
 5. `get_porting_report({"job_id": "..."})` for verification status, build/execution logs, `pointer_contracts`, and `kbuild/` artifacts
 
 Across server restarts, use `list_porting_jobs({})` to resume or inspect existing jobs. Submitting a new candidate creates a new numbered attempt while preserving historical verification records.
@@ -78,11 +79,12 @@ Across server restarts, use `list_porting_jobs({})` to resume or inspect existin
 | `get_porting_context` | Inspect per-function source, types, pointer contracts, and Rust correspondence |
 | `generate_rust` | Emit deterministic Cargo (`src/lib.rs`) + `no_std` Kbuild artifacts (`kbuild/*`) |
 | `submit_rust_candidate` | Persist agent-authored `src/lib.rs` as a new candidate attempt |
-| `verify_port` | Compile/run C (UBSan) vs. Rust (`cargo`, `no_std`, header check) differential harness |
+| `generate_port_cases` | Coverage-guided search over the original C for verification inputs; reports UB/crash/timeout inputs separately |
+| `verify_port` | Compile/run C (UBSan) vs. Rust (`cargo`, `no_std`, header check) differential harness over supplied or generated cases |
 | `get_porting_report` | Retrieve current job state, evidence, commands, and tamper/staleness checks |
 | `list_porting_jobs` | List the most recent 100 persisted porting jobs |
 
-Verification executes on the local host without OS container isolation, enforcing direct command invocation (no shell), process-group cleanup on Unix, and bounded budgets: max 32 generation attempts/job, max 64 verifications/job, 1–256 cases/run, 120 s overall operation timeout, 10 s per-case timeout, and 8 MiB per-stream output cap.
+Verification executes on the local host without OS container isolation, enforcing direct command invocation (no shell), process-group cleanup on Unix, and bounded budgets: max 32 generation attempts/job, max 64 verifications/job, max 64 input generations/job (1–256 cases, ≤500,000 executions, ≤60 s search, 1 s per execution), 1–256 cases/run, 120 s overall operation timeout, 10 s per-case timeout, and 8 MiB per-stream output cap.
 
 ---
 

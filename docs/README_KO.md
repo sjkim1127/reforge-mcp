@@ -38,7 +38,8 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 | 포팅 계획과 컨텍스트 | 함수 의존성 순서, 재귀 그룹, 포인터 접근·소유권 계약(`pointer_contracts`), 구조체·union·상수·외부 심볼·Kconfig 목록, 원본 범위와 Rust 대응 |
 | Rust 자동 생성 | 부호/무부호·고정폭 정수·`float`/`double`·enum·`void`·구조체/union·비트필드·배열(문자열 패딩 포함)·포인터·함수 포인터(`extern "C"`)·`rf_safe_*` 안전 래퍼·문자열·`static const`·루프·`switch`·전방 `goto`·`sizeof`·`malloc`/libc/builtin 호출, `rf_abi_*` 내보내기 및 커널 `#![no_std]`/`Kbuild`/`rf_port_bindings.h` 어댑터 |
 | AI 후보 제출 | `src/lib.rs`를 새 시도로 저장; 자동 생성 후보와 같은 검증 경로 사용 |
-| 원본/Rust 차등 검증 | C UBSan(`-lm` 링크), offline Cargo 빌드, `#![no_std]` rlib 및 C 바인딩 헤더 검증, 양방향 C↔Rust FFI 경계 링크, 동일 입력의 stdout/stderr/종료 코드 비교 |
+| 원본/Rust 차등 검증 | C UBSan(`-lm` 링크), offline Cargo 빌드, `#![no_std]` rlib 및 C 바인딩 헤더 검증, 양방향 C↔Rust FFI 경계 링크, 동일 입력의 stdout/stderr/종료 코드 비교(64비트 부호/무부호 정수, 유한한 `float`/`double` 입력) |
+| 검증 입력 자동 생성 | `generate_port_cases`가 원본 C를 UBSan과 SanitizerCoverage(`trace-pc-guard,trace-cmp`)로 빌드하고, 입력마다 프로세스를 fork해 커버리지 기반 탐색을 수행합니다. 간선 실행 횟수 구간으로 corpus를 고르고 비교 연산의 피연산자를 값 사전으로 쓰며, 전체 커버리지를 덮는 최소 집합과 다양한 정상 실행 입력(최대 16개)을 케이스로 돌려줍니다. UB·크래시·타임아웃을 낸 입력은 따로 보고하고 검증 케이스에는 넣지 않습니다(Unix 호스트) |
 | 작업 저장과 재개 | SQLite 작업/이벤트, 생성·검증 이력, 소스/후보 변경 시 검증 만료 |
 | 캠페인 인벤토리 | 파일 해시, 언어/빌드 manifest 발견, 페이지 조회, 소스 컨텍스트 |
 | 의존성 이전 수명주기 | Agent 작성 계약·후보, 어댑터 계획, 하위 캠페인 연결, JSON 실행 차등 검증 |
@@ -67,7 +68,7 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 1. `analyze_porting_project({"source_path":"/absolute/path/to/c-library"})`
 2. 반환된 `job_id`로 `create_porting_plan({"job_id":"..."})`
 3. `generate_rust({"job_id":"..."})`로 자동 생성하거나, `get_porting_context`를 읽고 `submit_rust_candidate`로 Rust 후보 제출
-4. `verify_port({"job_id":"...","entry_function":"score","cases":[[-7,3],[0,0],[200,10]]})`
+4. `verify_port({"job_id":"...","entry_function":"score","cases":[[-7,3],[0,0],[200,10]]})` 또는 `generate_port_cases({"job_id":"...","entry_function":"score"})`로 입력을 만든 뒤 `"use_generated_cases": true`로 검증
 5. `get_porting_report({"job_id":"..."})`로 검증 결과·로그·아티팩트 경로 확인
 
 재시작 후에는 `list_porting_jobs({})`로 작업을 찾아 보고서를 읽습니다. 실패한 후보를 수정해 제출하면 새 생성 시도가 생기며 이전 검증 기록은 유지됩니다. 원본이 바뀌면 새 분석 작업을 만들어야 합니다.
@@ -80,11 +81,12 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 | `get_porting_context` | 함수별 원본·타입·호출·포인터 계약·Rust 대응 조회 |
 | `generate_rust` | 결정적 Rust 생성 및 Cargo/`kbuild` 프로젝트 작성 |
 | `submit_rust_candidate` | 에이전트가 작성한 `src/lib.rs` 저장 |
-| `verify_port` | 원본/Rust 빌드·실행 비교와 evidence 저장 |
+| `generate_port_cases` | 원본 C에서 커버리지 기반으로 검증 입력 탐색, UB·크래시·타임아웃 입력은 별도 보고 |
+| `verify_port` | 제공하거나 생성한 입력으로 원본/Rust 빌드·실행 비교와 evidence 저장 |
 | `get_porting_report` | 현재 상태, 검증 이력, 변경 감지 조회 |
 | `list_porting_jobs` | 최근 100개 저장 작업 조회 |
 
-검증은 로컬 호스트에서 코드를 실행합니다. 명령은 셸 없이 실행하고 컴파일/실행 시간과 출력량을 제한하며 Unix에서는 프로세스 그룹을 정리합니다. 현재 OS 격리 sandbox는 제공하지 않습니다. 생성 시도는 작업당 32회, 검증은 64회, 한 검증의 fixture는 1–256개로 제한합니다. 분석/검증 한 번의 전체 시간은 120초, 각 fixture 실행은 10초, 프로세스별 stdout/stderr는 각각 8 MiB로 제한합니다.
+검증은 로컬 호스트에서 코드를 실행합니다. 명령은 셸 없이 실행하고 컴파일/실행 시간과 출력량을 제한하며 Unix에서는 프로세스 그룹을 정리합니다. 현재 OS 격리 sandbox는 제공하지 않습니다. 생성 시도는 작업당 32회, 검증은 64회, 입력 생성은 64회(케이스 1–256개, 실행 50만 회 이하, 탐색 60초 이하, 실행당 1초), 한 검증의 fixture는 1–256개로 제한합니다. 분석/검증 한 번의 전체 시간은 120초, 각 fixture 실행은 10초, 프로세스별 stdout/stderr는 각각 8 MiB로 제한합니다.
 
 ## 시작하기
 

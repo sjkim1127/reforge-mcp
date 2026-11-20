@@ -116,9 +116,75 @@ impl CommandRun {
     }
 }
 
+/// One entry-function argument in a verification fixture.
+///
+/// Serialized as a plain JSON number, so fixtures written as `[[1, 2]]` (including
+/// pre-existing int32 jobs) keep deserializing. Integers are converted to the
+/// parameter type with C cast semantics (two's complement wrapping); floats must
+/// be finite and are only accepted for `float`/`double` parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FixtureValue {
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+}
+
+impl FixtureValue {
+    /// Canonical form for an unsigned value: `Int` when it fits in `i64`.
+    pub fn from_u64(value: u64) -> Self {
+        i64::try_from(value).map_or(Self::UInt(value), Self::Int)
+    }
+
+    /// Exact decimal spelling passed on the command line to both drivers.
+    pub fn to_arg(self) -> String {
+        match self {
+            Self::Int(v) => v.to_string(),
+            Self::UInt(v) => v.to_string(),
+            // `Debug` is the shortest round-trip spelling (`0.1`, `1e300`, `-0.0`),
+            // accepted by both C `strtod` and Rust `str::parse::<f64>`.
+            Self::Float(v) => format!("{v:?}"),
+        }
+    }
+
+    pub fn is_integer(self) -> bool {
+        !matches!(self, Self::Float(_))
+    }
+}
+
+impl From<i32> for FixtureValue {
+    fn from(value: i32) -> Self {
+        Self::Int(value.into())
+    }
+}
+
+impl From<i64> for FixtureValue {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<u64> for FixtureValue {
+    fn from(value: u64) -> Self {
+        Self::from_u64(value)
+    }
+}
+
+impl From<f64> for FixtureValue {
+    fn from(value: f64) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl std::fmt::Display for FixtureValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_arg())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseResult {
-    pub arguments: Vec<i32>,
+    pub arguments: Vec<FixtureValue>,
     pub source: CommandRun,
     pub rust: Option<CommandRun>,
     pub matched: bool,
@@ -130,10 +196,47 @@ pub struct Verification {
     pub candidate_sha256: String,
     pub source_snapshot_sha256: String,
     pub entry_function: String,
-    pub fixtures: Vec<Vec<i32>>,
+    pub fixtures: Vec<Vec<FixtureValue>>,
     pub status: String,
     pub commands: Vec<CommandRun>,
     pub cases: Vec<CaseResult>,
+    pub limitation: String,
+}
+
+/// A generated input whose source execution exited or crashed (not UBSan).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedFailure {
+    pub arguments: Vec<FixtureValue>,
+    /// `exit:<code>` or `signal:<number>`.
+    pub outcome: String,
+}
+
+/// Evidence for one coverage-guided input generation run against the source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseGeneration {
+    pub attempt: usize,
+    pub entry_function: String,
+    pub source_snapshot_sha256: String,
+    /// `running`, `completed`, `failed`, `budget_exceeded`, `stale`, or `interrupted`.
+    pub status: String,
+    pub strategy: String,
+    pub seed: u64,
+    pub max_cases: usize,
+    pub max_executions: u64,
+    pub time_budget_ms: u64,
+    /// Driver counters: executions, corpus, instrumented_edges, covered_edges, features,
+    /// selected_features, coverage_cases, diversity_cases, undefined_behavior,
+    /// source_failures, timeouts, elapsed_ms.
+    pub stats: std::collections::BTreeMap<String, u64>,
+    /// Inputs that ran cleanly on the source: a greedy cover of every observed feature,
+    /// followed by up to 16 value-diverse clean runs.
+    pub cases: Vec<Vec<FixtureValue>>,
+    /// Sample inputs where the source hit UBSan-detected undefined behavior.
+    pub undefined_behavior: Vec<Vec<FixtureValue>>,
+    pub source_failures: Vec<GeneratedFailure>,
+    pub timeouts: Vec<Vec<FixtureValue>>,
+    pub commands: Vec<CommandRun>,
+    pub error: Option<String>,
     pub limitation: String,
 }
 
@@ -173,5 +276,48 @@ pub struct Job {
     pub generation_attempt: usize,
     pub candidate_sha256: Option<String>,
     pub verifications: Vec<Verification>,
+    #[serde(default)]
+    pub case_generations: Vec<CaseGeneration>,
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FixtureValue;
+
+    #[test]
+    fn fixture_values_keep_reading_int32_json_and_round_trip_wide_numbers() {
+        let values: Vec<FixtureValue> =
+            serde_json::from_str("[1, -7, 18446744073709551615, -2.5, 3.0]").unwrap();
+        assert_eq!(
+            values,
+            vec![
+                FixtureValue::Int(1),
+                FixtureValue::Int(-7),
+                FixtureValue::UInt(u64::MAX),
+                FixtureValue::Float(-2.5),
+                FixtureValue::Float(3.0),
+            ]
+        );
+        let json = serde_json::to_string(&values).unwrap();
+        assert_eq!(json, "[1,-7,18446744073709551615,-2.5,3.0]");
+        assert_eq!(FixtureValue::from(5_u64), FixtureValue::Int(5));
+    }
+
+    #[test]
+    fn fixture_arguments_use_exact_round_trip_spellings() {
+        for value in [0.1, 1e300, -0.0, 5e-324, f64::MAX] {
+            let arg = FixtureValue::Float(value).to_arg();
+            assert_eq!(
+                arg.parse::<f64>().unwrap().to_bits(),
+                value.to_bits(),
+                "{arg}"
+            );
+        }
+        assert_eq!(FixtureValue::Int(i64::MIN).to_arg(), "-9223372036854775808");
+        assert_eq!(
+            FixtureValue::UInt(u64::MAX).to_arg(),
+            "18446744073709551615"
+        );
+    }
 }

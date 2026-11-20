@@ -221,9 +221,39 @@ pub struct VerifyPortInput {
     pub job_id: String,
     pub entry_function: String,
     #[schemars(
-        description = "1 to 256 cases, each an array of int32 arguments matching the C function signature."
+        description = "1 to 256 cases, each an array of numbers matching the C function signature: 64-bit signed/unsigned integers (converted with C cast semantics) or finite floats for float/double parameters. Omit when use_generated_cases is true."
     )]
-    pub cases: Vec<Vec<i32>>,
+    pub cases: Option<Vec<Vec<serde_json::Number>>>,
+    #[schemars(
+        description = "Use the cases from the latest completed generate_port_cases run for this entry on the current source instead of `cases`."
+    )]
+    pub use_generated_cases: Option<bool>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GeneratePortCasesInput {
+    pub job_id: String,
+    pub entry_function: String,
+    #[schemars(description = "Cases to select, 1-256 (default 64).")]
+    pub max_cases: Option<usize>,
+    #[schemars(description = "Source executions including seeds, 1-500000 (default 20000).")]
+    pub max_executions: Option<u64>,
+    #[schemars(
+        description = "Wall-clock search budget in milliseconds, 100-60000 (default 10000)."
+    )]
+    pub time_budget_ms: Option<u64>,
+    #[schemars(description = "Random seed; the same seed and execution budget repeat the search.")]
+    pub seed: Option<u64>,
+}
+
+fn fixture_value(number: &serde_json::Number) -> reforge_engine::model::FixtureValue {
+    use reforge_engine::model::FixtureValue;
+    if let Some(v) = number.as_i64() {
+        FixtureValue::Int(v)
+    } else if let Some(v) = number.as_u64() {
+        FixtureValue::UInt(v)
+    } else {
+        FixtureValue::Float(number.as_f64().unwrap_or(f64::NAN))
+    }
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InventoryProjectInput {
@@ -507,16 +537,18 @@ impl ReforgeServer {
                 "kernel_nostd_kbuild_adapter": true,
                 "pointer_ownership_contracts": true,
                 "rust_generation": "deterministic_clang_ast_typed_c_subset",
-                "behavioral_verification": "fixture_level_library_functions"
+                "behavioral_verification": "fixture_level_library_functions",
+                "verification_fixture_values": "int64_uint64_finite_float",
+                "verification_input_generation": "coverage_guided_sanitizer_coverage_unix"
             },
             "analysis_backends": {
                 "clang_ast": "implemented_for_c_porting",
                 "tree_sitter": "implemented_for_source_lookup",
                 "joern": "planned_not_integrated"
             },
-            "porting_workflow": ["analyze_porting_project", "create_porting_plan", "get_porting_context", "generate_rust", "submit_rust_candidate", "verify_port", "get_porting_report", "list_porting_jobs"],
+            "porting_workflow": ["analyze_porting_project", "create_porting_plan", "get_porting_context", "generate_rust", "submit_rust_candidate", "generate_port_cases", "verify_port", "get_porting_report", "list_porting_jobs"],
             "campaign_workflow": ["inventory_project", "get_migration_inventory", "get_migration_source_context", "register_dependency_requirements", "record_dependency_candidate", "plan_dependency_adapter", "create_dependency_campaign", "get_dependency_requirements", "verify_dependency_replacement", "revise_dependency_requirements", "next_migration_tasks", "get_migration_campaign"],
-            "requirements": ["clang with UBSan", "rustc", "cargo"],
+            "requirements": ["clang with UBSan (and SanitizerCoverage for generate_port_cases)", "rustc", "cargo"],
             "supported_c": "signed/unsigned/bool/fixed-width integers (8/16/32/64, size_t, ptrdiff_t, intptr_t/uintptr_t), float/double, enums, void, repr(C) structs/unions/typedefs, struct bitfields, fixed-size arrays, string-padded char arrays, pointers (int *, const int *, struct *, union *, void *, ptr-int casts, null check, ownership/mutability contracts and safe ref wrappers rf_safe_*), function pointers (Option<extern \"C\" fn>), string literals, file-scope static const tables/constants, sizeof/alignof, loops (for, while, do-while, break, continue), switch/case/default with fallthrough, forward goto cleanup labels, definite-init locals, arithmetic/shift/compound assignments, direct internal and indirect calls, stdlib/heap/libc/builtins (malloc, calloc, realloc, free, memcpy, memmove, memset, strlen, strcmp, qsort, math.h, __builtin_*_overflow, __builtin_*), external C prototypes/FFI boundary files (ffi/, external/, *.ffi.c, *.external.c), bidirectional C ABI exports (rf_abi_*), compile_commands.json, CMakeLists.txt, Makefile, recursive Kbuild/Kconfig (.config, Kbuild, Makefile), auto header subdirs, kernel no_std + Kbuild/C-header adapter (kbuild/rf_kernel_port.rs, Kbuild, rf_port_bindings.h), include guards, macros, conditional compilation, and shared inline functions up to 4096 files / 64 MiB; no main, mutable global variables, static locals, backward/cross-scope goto, inline asm, variadics, _Complex, or reading uninitialized locals",
             "execution": "local host with time/output limits; not an OS security sandbox",
             "verification_policy": "Completion means the submitted entry-function fixtures passed on the pinned source and candidate; not whole-program equivalence. Undefined behavior in source cases blocks acceptance."
@@ -595,14 +627,57 @@ impl ReforgeServer {
     }
 
     #[tool(
-        description = "Build and execute the original C and Rust candidate on local host with supplied int32 cases. Uses UBSan for C, offline Cargo, and bounded processes. Stores compiler versions, logs, hashes and per-case comparisons. Completion only covers these entry-function fixtures."
+        description = "Search the original C source for verification inputs of an entry function: coverage-guided (SanitizerCoverage edges + comparison operands) with UBSan, one forked process per input. Returns cases that run cleanly and cover every observed edge/hit-count bucket plus value-diverse samples, and separately reports inputs that hit undefined behavior, crashes, or timeouts. Unix only; does not need a Rust candidate. Pass the cases to verify_port (or use_generated_cases)."
+    )]
+    async fn generate_port_cases(
+        &self,
+        Parameters(input): Parameters<GeneratePortCasesInput>,
+    ) -> Result<String, McpError> {
+        let defaults = reforge_engine::CaseGenerationOptions::default();
+        let options = reforge_engine::CaseGenerationOptions {
+            max_cases: input.max_cases.unwrap_or(defaults.max_cases),
+            max_executions: input.max_executions.unwrap_or(defaults.max_executions),
+            time_budget_ms: input.time_budget_ms.unwrap_or(defaults.time_budget_ms),
+            seed: input.seed.unwrap_or(defaults.seed),
+        };
+        let generation = porting_engine()?
+            .generate_cases(&input.job_id, &input.entry_function, options)
+            .await
+            .map_err(porting_error)?;
+        Ok(json!({"job_id": input.job_id, "generation": generation}).to_string())
+    }
+
+    #[tool(
+        description = "Build and execute the original C and Rust candidate on local host with supplied or generated cases (64-bit integers and finite floats). Uses UBSan for C, offline Cargo, and bounded processes. Stores compiler versions, logs, hashes and per-case comparisons. Completion only covers these entry-function fixtures."
     )]
     async fn verify_port(
         &self,
         Parameters(input): Parameters<VerifyPortInput>,
     ) -> Result<String, McpError> {
-        let job = porting_engine()?
-            .verify(&input.job_id, &input.entry_function, input.cases)
+        let engine = porting_engine()?;
+        let cases = match (input.cases, input.use_generated_cases.unwrap_or(false)) {
+            (Some(_), true) => {
+                return Err(McpError::invalid_params(
+                    "pass either cases or use_generated_cases, not both",
+                    None,
+                ));
+            }
+            (Some(cases), false) => cases
+                .iter()
+                .map(|case| case.iter().map(fixture_value).collect())
+                .collect(),
+            (None, true) => engine
+                .generated_cases(&input.job_id, &input.entry_function)
+                .map_err(porting_error)?,
+            (None, false) => {
+                return Err(McpError::invalid_params(
+                    "provide cases or set use_generated_cases",
+                    None,
+                ));
+            }
+        };
+        let job = engine
+            .verify_values(&input.job_id, &input.entry_function, cases)
             .await
             .map_err(porting_error)?;
         Ok(json!(job).to_string())
@@ -1729,7 +1804,7 @@ impl ReforgeServer {
 #[tool_handler(
     name = "reforge-mcp",
     version = "0.1.0",
-    instructions = "Reforge-MCP provides agent-facing Rust migration campaigns and a typed C-to-Rust translation backend for both kernel C and general-purpose C (fixed-width/unsigned/bool integers, float/double, enums, void, structs/unions, bitfields, fixed arrays, pointers, pointer-int casts, extern C function pointers, string literals, static const globals, loops, switch, forward goto, sizeof, stdlib/malloc/free/qsort/builtins, C ABI exports, compile_commands.json, CMakeLists.txt, Makefile, and recursive Kbuild/Kconfig). Start with get_porting_capabilities. Campaign workflow: inventory_project, inspect paginated files/source context, register_dependency_requirements, agent researches and records candidates, plan_dependency_adapter, agent prepares implementations and local executables, verify_dependency_replacement, next_migration_tasks. Missing replacements can link create_dependency_campaign. Research metadata is agent asserted; server does not search registries or compile dependency probes. Accepted dependency fixtures never mean whole-program completion. C translation workflow: analyze_porting_project, create_porting_plan, generate_rust or submit_rust_candidate, verify_port, get_porting_report. Local execution has limits, not an OS sandbox. Java/C++/Python/Go translation and Joern remain planned."
+    instructions = "Reforge-MCP provides agent-facing Rust migration campaigns and a typed C-to-Rust translation backend for both kernel C and general-purpose C (fixed-width/unsigned/bool integers, float/double, enums, void, structs/unions, bitfields, fixed arrays, pointers, pointer-int casts, extern C function pointers, string literals, static const globals, loops, switch, forward goto, sizeof, stdlib/malloc/free/qsort/builtins, C ABI exports, compile_commands.json, CMakeLists.txt, Makefile, and recursive Kbuild/Kconfig). Start with get_porting_capabilities. Campaign workflow: inventory_project, inspect paginated files/source context, register_dependency_requirements, agent researches and records candidates, plan_dependency_adapter, agent prepares implementations and local executables, verify_dependency_replacement, next_migration_tasks. Missing replacements can link create_dependency_campaign. Research metadata is agent asserted; server does not search registries or compile dependency probes. Accepted dependency fixtures never mean whole-program completion. C translation workflow: analyze_porting_project, create_porting_plan, generate_rust or submit_rust_candidate, generate_port_cases (optional coverage-guided inputs), verify_port, get_porting_report. Local execution has limits, not an OS sandbox. Java/C++/Python/Go translation and Joern remain planned."
 )]
 impl ServerHandler for ReforgeServer {}
 
