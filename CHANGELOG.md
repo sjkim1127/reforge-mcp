@@ -29,6 +29,7 @@ Releases follow [Semantic Versioning](https://semver.org/).
 ### Changed
 - Product, stdio server identity, executable, and release archives renamed to `reforge-mcp`; update MCP client command paths.
 - Previous README preserved in `docs/fossil-reference.md`; internal crate names, cache paths, and `FOSSIL_*` variables retained.
+- `clang.rs` translator split into focused `clang/` submodules (no behavior change).
 - README now documents the full MCP tool surface and current output contracts.
 - CI product baseline now includes warning-free Clippy checks.
 - Vulnerability scanning now uses named built-in heuristic patterns instead of mock CVE exact matching.
