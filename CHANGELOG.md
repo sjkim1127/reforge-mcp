@@ -28,8 +28,13 @@ Releases follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - Product, stdio server identity, executable, and release archives renamed to `reforge-mcp`; update MCP client command paths.
-- Previous README preserved in `docs/fossil-reference.md`; internal crate names, cache paths, and `FOSSIL_*` variables retained.
+- Previous README preserved in `docs/fossil-reference.md`.
+- Workspace crates renamed from `fossil-{core,repo,indexer,search,server}` to `reforge-{core,repo,indexer,search,server}`.
+- Environment variables renamed to `REFORGE_LOG` and `REFORGE_CACHE_DIR`; `FOSSIL_LOG` / `FOSSIL_CACHE_DIR` remain as deprecated fallbacks with a startup warning.
+- Default clone/index cache moved to `~/.reforge-mcp/cache`; an existing `~/.fossil-mcp/cache` keeps being used until the new directory exists.
+- `REFORGE_DATA_DIR` resolution shared by porting jobs and campaigns; an empty value now falls back to the default directory.
 - `clang.rs` translator split into focused `clang/` submodules (no behavior change).
+- Default log filter now targets the `reforge_mcp` binary (`reforge_mcp=info,warn`); the previous `fossil_server` target matched no log events, so server info logs were silently dropped.
 - README now documents the full MCP tool surface and current output contracts.
 - CI product baseline now includes warning-free Clippy checks.
 - Vulnerability scanning now uses named built-in heuristic patterns instead of mock CVE exact matching.

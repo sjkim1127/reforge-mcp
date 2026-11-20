@@ -184,7 +184,10 @@ Measured across **10 real open-source C projects** (**28 C translation units**, 
 
 ## Compatibility, Documentation & Development
 
-- **Rebrand compatibility**: binary name changed from `fossil-mcp` to `reforge-mcp` (update MCP `command` paths), while `FOSSIL_CACHE_DIR`, `FOSSIL_LOG`, internal `fossil-*` crate names, and existing SQLite paths are preserved.
+- **Rebrand compatibility**: the binary is `reforge-mcp` (formerly `fossil-mcp`; update MCP `command` paths) and workspace crates are `reforge-{core,repo,indexer,search,server,engine}`.
+  - Environment variables: `REFORGE_LOG` (tracing filter, e.g. `REFORGE_LOG=reforge_mcp=debug,warn`), `REFORGE_CACHE_DIR` (clone/index cache), and `REFORGE_DATA_DIR` (porting jobs & campaigns). The legacy `FOSSIL_LOG` / `FOSSIL_CACHE_DIR` are still honored when the new name is unset, and the server logs a deprecation warning.
+  - Clone/index cache defaults to `~/.reforge-mcp/cache`. If only the pre-rebrand `~/.fossil-mcp/cache` exists it keeps being used (its `global.db` stores absolute clone paths), so existing indexes survive; delete it and re-index to switch.
+  - Vulnerability `pattern_id` values keep their `FOSSIL-*` prefix as stable result identifiers.
 - **Design docs**:
   - [Ecosystem Migration Design](docs/ecosystem-migration-design.md)
   - [Kernel-Scale Roadmap](docs/kernel-scale-roadmap.md)

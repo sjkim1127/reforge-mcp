@@ -26,14 +26,7 @@ impl CampaignService {
         })
     }
     pub fn from_env() -> Result<Self> {
-        let root = std::env::var_os("REFORGE_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::cache_dir()
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("reforge-mcp")
-            });
-        Self::new(&root)
+        Self::new(&crate::data_root())
     }
     pub fn inventory_project(&self, name: &str, path: &Path) -> Result<Campaign> {
         self.create(name, path, None)

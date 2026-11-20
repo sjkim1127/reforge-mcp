@@ -88,7 +88,7 @@ AI 에이전트가 원본을 분석하고 Rust 후보를 작성할 수 있도록
 
 ## 시작하기
 
-서버 빌드는 Rust 1.88 이상이 필요합니다. 포팅 분석/검증에는 PATH의 `clang`(JSON AST 및 UBSan 지원), `rustc`, `cargo`가 필요합니다. 내부 `fossil-*` 크레이트 이름은 기존 이름을 사용합니다.
+서버 빌드는 Rust 1.88 이상이 필요합니다. 포팅 분석/검증에는 PATH의 `clang`(JSON AST 및 UBSan 지원), `rustc`, `cargo`가 필요합니다. 워크스페이스 크레이트 이름은 `reforge-{core,repo,indexer,search,server,engine}`입니다.
 
 ```bash
 git clone https://github.com/sjkim1127/reforge-mcp
@@ -169,7 +169,7 @@ python3 scripts/oss_e2e_benchmark.py
 
 ## 전환 및 호환성
 
-실행 파일 이름은 `fossil-mcp`에서 `reforge-mcp`로 변경됩니다. 기존 MCP 설정의 command 경로를 갱신해야 합니다. 릴리즈 아카이브도 새 이름을 사용합니다. 기존 로컬 데이터 재사용을 위해 `FOSSIL_CACHE_DIR`, `FOSSIL_LOG`와 SQLite 저장 경로는 유지합니다. GitHub 저장소는 `sjkim1127/reforge-mcp`로 변경했습니다. 기존 로컬 체크아웃 폴더는 그대로 사용해도 됩니다.
+실행 파일 이름은 `fossil-mcp`에서 `reforge-mcp`로 변경됩니다. 기존 MCP 설정의 command 경로를 갱신해야 합니다. 릴리즈 아카이브도 새 이름을 사용합니다. 환경 변수는 `REFORGE_LOG`(로그 필터), `REFORGE_CACHE_DIR`(클론/인덱스 캐시), `REFORGE_DATA_DIR`(포팅 작업·캠페인)입니다. 이전 이름인 `FOSSIL_LOG`, `FOSSIL_CACHE_DIR`는 새 이름이 없을 때 계속 인식하며, 서버가 폐기 예정 경고를 남깁니다. 클론/인덱스 캐시의 기본 경로는 `~/.reforge-mcp/cache`입니다. 다만 이전 경로 `~/.fossil-mcp/cache`만 있으면 그 경로를 계속 사용합니다(`global.db`가 클론의 절대 경로를 저장하기 때문). 새 경로로 옮기려면 이전 캐시를 지우고 다시 인덱싱하면 됩니다. 취약점 `pattern_id`의 `FOSSIL-*` 접두사는 결과 식별자 안정성을 위해 유지합니다. GitHub 저장소는 `sjkim1127/reforge-mcp`로 변경했습니다. 기존 로컬 체크아웃 폴더는 그대로 사용해도 됩니다.
 
 ## 설계와 개발
 
