@@ -1,5 +1,6 @@
 > Historical Fossil-MCP reference retained during the Reforge-MCP transition.
 > Use the root README for current branding, binary names, and implementation status.
+> Crate names (`fossil-*` → `reforge-*`), `FOSSIL_*` variables (→ `REFORGE_*`), and the default cache path (→ `~/.reforge-mcp/cache`) below are pre-rebrand values.
 
 <p align="center">
   <img src="assets/fossil-logo.svg" alt="fossil-mcp logo" width="720">

@@ -1,0 +1,30 @@
+[package]
+name = "reforge-server"
+description = "MCP server entry point for Reforge-MCP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "reforge-mcp"
+path = "src/main.rs"
+
+[dependencies]
+reforge-engine = { path = "../reforge-engine" }
+reforge-core.workspace = true
+reforge-repo.workspace = true
+reforge-indexer.workspace = true
+reforge-search.workspace = true
+
+rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
+schemars.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+walkdir.workspace = true

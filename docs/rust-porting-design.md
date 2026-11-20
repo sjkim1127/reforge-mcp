@@ -115,10 +115,10 @@ CPG와 분리된 제품 모델을 두어 분석 백엔드를 교체할 수 있�
 
 ## 기존 코드와 이름 전환
 
-- `fossil-repo`: 원본 스냅샷과 Git 작업 기반.
-- `fossil-indexer`: 기존 소스 검색 기반. Joern 어댑터 및 포팅 모델은 별도 모듈/크레이트로 확장.
-- `fossil-search`: 포팅 컨텍스트 탐색의 보조 기능.
-- `fossil-core`: 기존 SQLite와 로드맵. 포팅 상태/근거 저장을 추가할 위치.
-- `fossil-server`: `reforge-mcp` 실행 파일과 MCP 조정 계층.
+- `reforge-repo`: 원본 스냅샷과 Git 작업 기반.
+- `reforge-indexer`: 기존 소스 검색 기반. Joern 어댑터 및 포팅 모델은 별도 모듈/크레이트로 확장.
+- `reforge-search`: 포팅 컨텍스트 탐색의 보조 기능.
+- `reforge-core`: 기존 SQLite와 로드맵. 포팅 상태/근거 저장을 추가할 위치.
+- `reforge-server`: `reforge-mcp` 실행 파일과 MCP 조정 계층.
 
-실행 파일·MCP 제품 이름·릴리즈 아카이브를 먼저 전환한다. 내부 크레이트 이름, `FOSSIL_*` 환경변수, 저장 경로는 현재 유지한다. GitHub 저장소는 `sjkim1127/reforge-mcp`로 변경한다. 내부 이름/캐시 이전은 별도 호환성 변경으로 처리한다. 기존 문서는 `docs/fossil-reference.md`에 보존한다.
+실행 파일·MCP 제품 이름·릴리즈 아카이브에 이어 내부 크레이트 이름(`reforge-*`)과 환경 변수(`REFORGE_LOG`, `REFORGE_CACHE_DIR`)도 전환했다. `FOSSIL_*` 환경 변수와 기존 `~/.fossil-mcp/cache`는 하위 호환 폴백으로만 인식한다. GitHub 저장소는 `sjkim1127/reforge-mcp`다. 기존 문서는 `docs/fossil-reference.md`에 보존한다.

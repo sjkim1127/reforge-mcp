@@ -76,6 +76,22 @@ const MAX_HEADER_DEPENDENCIES: usize = 4096;
 const MANIFEST: &str = "[package]\nname = \"reforge-port\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[lib]\npath = \"src/lib.rs\"\n";
 const LIMITATION: &str = "Fixture-level evidence for C library functions (int32, void, structs, pointers, loops, external calls); not proof of whole-program equivalence. Local host execution with time/output limits, not a security sandbox.";
 
+/// Environment variable that overrides the porting/campaign state directory.
+pub const DATA_DIR_ENV: &str = "REFORGE_DATA_DIR";
+
+/// Root for porting jobs and migration campaigns: `REFORGE_DATA_DIR`, else the
+/// OS cache directory under `reforge-mcp`.
+pub fn data_root() -> PathBuf {
+    std::env::var_os(DATA_DIR_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("reforge-mcp")
+        })
+}
+
 pub struct Engine {
     store: Store,
 }
@@ -86,14 +102,7 @@ impl Engine {
         })
     }
     pub fn from_env() -> Result<Self> {
-        let root = std::env::var_os("REFORGE_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::cache_dir()
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("reforge-mcp")
-            });
-        Self::new(&root)
+        Self::new(&data_root())
     }
     pub fn list(&self) -> Result<serde_json::Value> {
         Ok(

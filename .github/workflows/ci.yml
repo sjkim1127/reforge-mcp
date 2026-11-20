@@ -148,8 +148,8 @@ jobs:
     continue-on-error: true
     env:
       RUN_E2E: "1"
-      # Fossil-mcp stores cloned repos here; cache it across runs
-      FOSSIL_CACHE_DIR: ~/.fossil-mcp/cache
+      # Reforge-MCP stores cloned repos here; cache it across runs
+      REFORGE_CACHE_DIR: ~/.reforge-mcp/cache
 
     steps:
       - uses: actions/checkout@v4
@@ -174,10 +174,10 @@ jobs:
       - name: Cache Reforge-MCP repo clones
         uses: actions/cache@v4
         with:
-          path: ${{ env.FOSSIL_CACHE_DIR }}
-          key: fossil-clone-cache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.REFORGE_CACHE_DIR }}
+          key: reforge-clone-cache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            fossil-clone-cache-${{ runner.os }}-
+            reforge-clone-cache-${{ runner.os }}-
 
       - name: Build workspace (for E2E)
         run: cargo build --workspace
@@ -186,12 +186,12 @@ jobs:
       # `--test-threads=1` prevents them from racing over shared clone dirs.
       - name: Run E2E tests
         run: |
-          cargo test -p fossil-server \
+          cargo test -p reforge-server \
             -- --include-ignored --test-threads=1 \
             2>&1 | tee e2e_output.txt
         env:
           RUN_E2E: "1"
-          FOSSIL_CACHE_DIR: ${{ env.FOSSIL_CACHE_DIR }}
+          REFORGE_CACHE_DIR: ${{ env.REFORGE_CACHE_DIR }}
 
       # Surface the output as a step summary regardless of pass/fail
       - name: Upload E2E output

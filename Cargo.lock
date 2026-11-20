@@ -796,90 +796,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fossil-core"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "chrono",
- "dirs",
- "rusqlite",
- "serde",
- "serde_json",
- "sqlite-vec",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "fossil-indexer"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "fossil-core",
- "notify",
- "protobuf",
- "rayon",
- "scip",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tree-sitter",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "walkdir",
-]
-
-[[package]]
-name = "fossil-repo"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "fossil-core",
- "git2",
- "hex",
- "serde",
- "sha2",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "fossil-search"
-version = "0.1.0"
-dependencies = [
- "fastembed",
- "fossil-core",
- "nucleo-matcher",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fossil-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "fossil-core",
- "fossil-indexer",
- "fossil-repo",
- "fossil-search",
- "reforge-engine",
- "rmcp",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "walkdir",
-]
-
-[[package]]
 name = "fs2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2464,6 +2380,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reforge-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "chrono",
+ "dirs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "reforge-engine"
 version = "0.1.0"
 dependencies = [
@@ -2479,6 +2410,75 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "reforge-indexer"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "notify",
+ "protobuf",
+ "rayon",
+ "reforge-core",
+ "scip",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "walkdir",
+]
+
+[[package]]
+name = "reforge-repo"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "git2",
+ "hex",
+ "reforge-core",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "reforge-search"
+version = "0.1.0"
+dependencies = [
+ "fastembed",
+ "nucleo-matcher",
+ "reforge-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "reforge-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reforge-core",
+ "reforge-engine",
+ "reforge-indexer",
+ "reforge-repo",
+ "reforge-search",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "walkdir",
 ]
 

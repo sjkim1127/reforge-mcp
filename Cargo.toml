@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/fossil-core",
-    "crates/fossil-repo",
-    "crates/fossil-indexer",
-    "crates/fossil-search",
-    "crates/fossil-server",
+    "crates/reforge-core",
+    "crates/reforge-repo",
+    "crates/reforge-indexer",
+    "crates/reforge-search",
+    "crates/reforge-server",
     "crates/reforge-engine",
 ]
 resolver = "2"
@@ -18,10 +18,10 @@ repository = "https://github.com/sjkim1127/reforge-mcp"
 
 [workspace.dependencies]
 # Internal crates
-fossil-core = { path = "crates/fossil-core" }
-fossil-repo = { path = "crates/fossil-repo" }
-fossil-indexer = { path = "crates/fossil-indexer" }
-fossil-search = { path = "crates/fossil-search" }
+reforge-core = { path = "crates/reforge-core" }
+reforge-repo = { path = "crates/reforge-repo" }
+reforge-indexer = { path = "crates/reforge-indexer" }
+reforge-search = { path = "crates/reforge-search" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
