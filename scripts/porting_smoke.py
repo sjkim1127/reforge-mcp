@@ -110,6 +110,13 @@ def main():
         undefined = client.tool("verify_port", {"job_id": real["job_id"], "entry_function": "abs", "cases": [[-2147483648]]})
         assert undefined["state"] == "blocked"
         assert undefined["verifications"][-1]["status"] == "source_failed"
+        generated = client.tool("generate_port_cases", {"job_id": real["job_id"], "entry_function": "abs", "max_executions": 3000})["generation"]
+        assert generated["status"] == "completed", generated
+        assert [-2147483648] in generated["undefined_behavior"], generated["undefined_behavior"]
+        assert generated["cases"] and [-2147483648] not in generated["cases"]
+        generated_verified = client.tool("verify_port", {"job_id": real["job_id"], "entry_function": "abs", "use_generated_cases": True})
+        assert generated_verified["state"] == "completed", generated_verified
+        (data / "musl-abs-generated-cases.json").write_text(json.dumps(generated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         blocked = client.tool("analyze_porting_project", {"source_path": str(ROOT / "fixtures/porting/unsupported")})
         assert blocked["state"] == "blocked" and blocked["unsupported"]
     finally:
@@ -124,7 +131,9 @@ def main():
         print(json.dumps({"job_id": job_id, "state": report["state"], "matched_cases": len(cases), "restart_resume": True, "unsupported_global": "blocked",
                     "header_cases": 6,
                     "musl_abs_cases": 6,
-                    "musl_abs_int_min": "blocked", "report": str(output)}, ensure_ascii=False))
+                    "musl_abs_int_min": "blocked",
+                    "musl_abs_generated_cases": len(generated["cases"]),
+                    "musl_abs_generated_ub": generated["undefined_behavior"], "report": str(output)}, ensure_ascii=False))
     finally:
         resumed.close()
 

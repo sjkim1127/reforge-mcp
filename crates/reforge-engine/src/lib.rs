@@ -1,7 +1,9 @@
 //! A persistent, bounded C-to-Rust vertical slice, independent of code-search infrastructure.
 pub mod campaign;
+mod casegen;
 mod clang;
 mod dependencies;
+mod harness;
 mod kbuild;
 pub mod model;
 mod process;
@@ -19,8 +21,8 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use model::{
-    CaseResult, Diagnostic, ExternalFunction, Function, HeaderDependency, Job, SourceFile,
-    StructDef, Verification,
+    CaseGeneration, CaseResult, Diagnostic, ExternalFunction, FixtureValue, Function,
+    HeaderDependency, Job, SourceFile, StructDef, Verification,
 };
 use store::Store;
 
@@ -74,7 +76,8 @@ const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CANDIDATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_DEPENDENCIES: usize = 4096;
 const MANIFEST: &str = "[package]\nname = \"reforge-port\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[lib]\npath = \"src/lib.rs\"\n";
-const LIMITATION: &str = "Fixture-level evidence for C library functions (int32, void, structs, pointers, loops, external calls); not proof of whole-program equivalence. Local host execution with time/output limits, not a security sandbox.";
+const CASE_GENERATION_LIMITATION: &str = "Inputs come from bounded coverage-guided search over the original C source (SanitizerCoverage edges with hit-count buckets and comparison operands). Coverage counts span every instrumented project function, not only the entry. Absence of undefined behavior or failures is not proven for untried inputs. Local host execution with time limits, not a security sandbox.";
+const LIMITATION: &str = "Fixture-level evidence for C library functions (integer/float scalars, void, structs, pointers, loops, external calls); not proof of whole-program equivalence. Local host execution with time/output limits, not a security sandbox.";
 
 /// Environment variable that overrides the porting/campaign state directory.
 pub const DATA_DIR_ENV: &str = "REFORGE_DATA_DIR";
@@ -90,6 +93,48 @@ pub fn data_root() -> PathBuf {
                 .unwrap_or_else(std::env::temp_dir)
                 .join("reforge-mcp")
         })
+}
+
+/// Budget and selection limits for [`Engine::generate_cases`].
+#[derive(Debug, Clone, Copy)]
+pub struct CaseGenerationOptions {
+    /// Cases to select for verification (1-256).
+    pub max_cases: usize,
+    /// Source executions, including seeds (1-500,000).
+    pub max_executions: u64,
+    /// Wall-clock search budget in milliseconds (100-60,000).
+    pub time_budget_ms: u64,
+    /// Random seed; the same seed and execution budget repeat the same search.
+    pub seed: u64,
+}
+
+impl Default for CaseGenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_cases: 64,
+            max_executions: 20_000,
+            time_budget_ms: 10_000,
+            seed: 0x5eed,
+        }
+    }
+}
+
+impl CaseGenerationOptions {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=256).contains(&self.max_cases),
+            "max_cases must be between 1 and 256"
+        );
+        ensure!(
+            (1..=500_000).contains(&self.max_executions),
+            "max_executions must be between 1 and 500000"
+        );
+        ensure!(
+            (100..=60_000).contains(&self.time_budget_ms),
+            "time_budget_ms must be between 100 and 60000"
+        );
+        Ok(())
+    }
 }
 
 pub struct Engine {
@@ -128,6 +173,11 @@ impl Engine {
                 && evidence.status == "running"
             {
                 evidence.status = "interrupted".into();
+            }
+        }
+        for generation in &mut job.case_generations {
+            if generation.status == "running" {
+                generation.status = "interrupted".into();
             }
         }
         Ok(job)
@@ -181,6 +231,7 @@ impl Engine {
             generation_attempt: 0,
             candidate_sha256: None,
             verifications: Vec::new(),
+            case_generations: Vec::new(),
             last_error: None,
         };
         let mut bytes = 0;
@@ -634,7 +685,275 @@ impl Engine {
         }
         Ok(())
     }
+    /// Search the original C source for inputs that exercise distinct coverage of
+    /// `entry`, recording them (and inputs that hit undefined behavior) as evidence.
+    pub async fn generate_cases(
+        &self,
+        id: &str,
+        entry: &str,
+        options: CaseGenerationOptions,
+    ) -> Result<CaseGeneration> {
+        ensure!(
+            cfg!(unix),
+            "verification input generation requires a Unix host (fork-based executor)"
+        );
+        options.validate()?;
+        let _lock = self.store.lock(id)?;
+        let mut job = self.load_locked_job(id)?;
+        self.fresh_source(&job)?;
+        supported(&job)?;
+        ensure!(
+            job.case_generations.len() < 64,
+            "case generation attempt limit (64) reached"
+        );
+        let function = job
+            .functions
+            .iter()
+            .find(|f| f.name == entry)
+            .context("unknown entry function")?
+            .clone();
+        let signature = harness::EntrySignature::from_function(&function)?;
+        let mut generation = CaseGeneration {
+            attempt: job.case_generations.len() + 1,
+            entry_function: entry.into(),
+            source_snapshot_sha256: job.source_snapshot_sha256.clone(),
+            status: "running".into(),
+            strategy: "coverage_guided_fork".into(),
+            seed: options.seed,
+            max_cases: options.max_cases,
+            max_executions: options.max_executions,
+            time_budget_ms: options.time_budget_ms,
+            stats: BTreeMap::new(),
+            cases: Vec::new(),
+            undefined_behavior: Vec::new(),
+            source_failures: Vec::new(),
+            timeouts: Vec::new(),
+            commands: Vec::new(),
+            error: None,
+            limitation: CASE_GENERATION_LIMITATION.into(),
+        };
+        job.case_generations.push(generation.clone());
+        self.store.save(&job)?;
+        generation.status = "failed".into();
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATION_SECONDS),
+            self.generate_cases_inner(&job, entry, &signature, &options, &mut generation),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                generation.status = "budget_exceeded".into();
+                Err(anyhow::anyhow!(
+                    "case generation exceeded the 120 second operation budget"
+                ))
+            }
+        };
+        if let Err(error) = result {
+            generation.error = Some(format!("{error:#}"));
+        }
+        if self.fresh_source(&job).is_err() {
+            generation.status = "stale".into();
+            generation.error = Some("source changed during case generation".into());
+        }
+        *job.case_generations
+            .last_mut()
+            .context("missing case generation attempt")? = generation.clone();
+        self.store.save(&job)?;
+        Ok(generation)
+    }
+
+    async fn generate_cases_inner(
+        &self,
+        job: &Job,
+        entry: &str,
+        signature: &harness::EntrySignature,
+        options: &CaseGenerationOptions,
+        generation: &mut CaseGeneration,
+    ) -> Result<()> {
+        let dir = self
+            .store
+            .directory(&job.job_id)?
+            .join("case-generation")
+            .join(generation.attempt.to_string());
+        std::fs::create_dir_all(&dir)?;
+        let logs = dir.join("logs");
+        let run = process::run(
+            "clang",
+            &["--version".into()],
+            &dir,
+            &logs,
+            "clang-version",
+            15,
+        )
+        .await?;
+        let ok = run.success();
+        generation.commands.push(run);
+        ensure!(ok, "clang version probe failed");
+
+        let snapshot = self.store.directory(&job.job_id)?.join("source");
+        let kb = kbuild::load(&snapshot)?;
+        let compile_flags = load_compile_commands(&snapshot, Path::new(&job.source_path))?;
+        let auto_includes = header_include_flags(&snapshot, &job.source_files);
+        let mut objects = Vec::new();
+        for (idx, file) in job
+            .source_files
+            .iter()
+            .filter(|f| f.path.ends_with(".c") && !job.inactive_source_files.contains(&f.path))
+            .enumerate()
+        {
+            let obj = dir.join(format!("source-{idx}.o"));
+            let extra = compile_flags
+                .get(&file.path)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let kb_flags = kb.cflags_for(&file.path);
+            let mut args = vec![];
+            if !extra.iter().any(|f| f.starts_with("-std="))
+                && !kb_flags.iter().any(|f| f.starts_with("-std="))
+            {
+                args.push("-std=c11".into());
+            }
+            args.extend([
+                "-c".into(),
+                "-O0".into(),
+                "-fno-builtin".into(),
+                "-I".into(),
+                snapshot.display().to_string(),
+                "-fsanitize=undefined".into(),
+                "-fno-sanitize-recover=all".into(),
+                casegen::COVERAGE_FLAGS.into(),
+            ]);
+            args.extend(auto_includes.iter().cloned());
+            args.extend(kb_flags);
+            args.extend(extra.iter().cloned());
+            args.extend([
+                snapshot.join(&file.path).display().to_string(),
+                "-o".into(),
+                obj.display().to_string(),
+            ]);
+            let run = process::run(
+                "clang",
+                &args,
+                &dir,
+                &logs,
+                &format!("compile-source-{idx}"),
+                30,
+            )
+            .await?;
+            let ok = run.success();
+            generation.commands.push(run);
+            ensure!(ok, "instrumented C build failed on {}", file.path);
+            objects.push(obj.display().to_string());
+        }
+
+        std::fs::write(
+            dir.join("fuzz_driver.c"),
+            casegen::render_driver(job, entry, signature)?,
+        )?;
+        let driver_obj = dir.join("fuzz_driver.o");
+        let run = process::run(
+            "clang",
+            &[
+                "-std=gnu11".into(),
+                "-O0".into(),
+                // Call the project's definitions even when they share a libc name (`abs`).
+                "-fno-builtin".into(),
+                "-c".into(),
+                "fuzz_driver.c".into(),
+                "-o".into(),
+                driver_obj.display().to_string(),
+            ],
+            &dir,
+            &logs,
+            "compile-driver",
+            30,
+        )
+        .await?;
+        let ok = run.success();
+        generation.commands.push(run);
+        ensure!(ok, "case generation driver build failed");
+
+        let fuzzer = dir.join(executable("case-generator"));
+        let mut link_args = vec![
+            "-fsanitize=undefined".into(),
+            driver_obj.display().to_string(),
+        ];
+        link_args.extend(objects);
+        link_args.extend(["-lm".into(), "-o".into(), fuzzer.display().to_string()]);
+        let run = process::run("clang", &link_args, &dir, &logs, "link-generator", 30).await?;
+        let ok = run.success();
+        generation.commands.push(run);
+        ensure!(ok, "case generation link failed");
+
+        let budget_seconds = options.time_budget_ms.div_ceil(1000) + 30;
+        let mut run = process::run(
+            &fuzzer.display().to_string(),
+            &[
+                options.seed.to_string(),
+                options.max_executions.to_string(),
+                options.time_budget_ms.to_string(),
+                options.max_cases.to_string(),
+            ],
+            &dir,
+            &logs,
+            "generate",
+            budget_seconds,
+        )
+        .await?;
+        let ok = run.success();
+        let stdout = std::fs::read_to_string(&run.stdout_path).unwrap_or_default();
+        run.compact();
+        generation.commands.push(run);
+        ensure!(ok, "case generator did not finish cleanly");
+        let output = casegen::parse_output(&stdout, signature)?;
+        generation.stats = output.stats;
+        generation.cases = output.cases;
+        generation.undefined_behavior = output.undefined_behavior;
+        generation.source_failures = output.source_failures;
+        generation.timeouts = output.timeouts;
+        generation.status = "completed".into();
+        Ok(())
+    }
+
+    /// Cases from the latest completed generation for `entry` on the current source.
+    pub fn generated_cases(&self, id: &str, entry: &str) -> Result<Vec<Vec<FixtureValue>>> {
+        let job = self.report(id)?;
+        let generation = job
+            .case_generations
+            .iter()
+            .rev()
+            .find(|g| g.entry_function == entry && g.status == "completed")
+            .with_context(|| {
+                format!("no completed case generation for {entry}; run generate_port_cases first")
+            })?;
+        ensure!(
+            generation.source_snapshot_sha256 == job.source_snapshot_sha256,
+            "latest case generation for {entry} used a different source snapshot; regenerate"
+        );
+        ensure!(
+            !generation.cases.is_empty(),
+            "latest case generation for {entry} found no inputs that run cleanly on the source"
+        );
+        Ok(generation.cases.clone())
+    }
+
+    /// Verify with int32 fixtures (the original contract).
     pub async fn verify(&self, id: &str, entry: &str, fixtures: Vec<Vec<i32>>) -> Result<Job> {
+        let fixtures = fixtures
+            .into_iter()
+            .map(|case| case.into_iter().map(FixtureValue::from).collect())
+            .collect();
+        self.verify_values(id, entry, fixtures).await
+    }
+
+    /// Verify with typed fixtures: 64-bit signed/unsigned integers and finite floats.
+    pub async fn verify_values(
+        &self,
+        id: &str,
+        entry: &str,
+        fixtures: Vec<Vec<FixtureValue>>,
+    ) -> Result<Job> {
         let _lock = self.store.lock(id)?;
         let mut job = self.load_locked_job(id)?;
         self.fresh(&job)?;
@@ -663,30 +982,14 @@ impl Engine {
                 .all(|args| args.len() == function.parameters.len()),
             "fixture argument count does not match entry signature"
         );
-        let param_types: Vec<String> = if function.parameter_types.is_empty() {
-            vec!["int".into(); function.parameters.len()]
-        } else {
-            function.parameter_types.clone()
-        };
-        for pty in &param_types {
-            ensure!(
-                is_supported_entry_int(pty).is_some()
-                    || is_supported_entry_float(pty).is_some()
-                    || matches!(pty.as_str(), "int *" | "const int *"),
-                "verify_port entry parameter type {pty:?} requires a scalar number or int* wrapper entry"
-            );
+        let signature = harness::EntrySignature::from_function(&function)?;
+        for case in &fixtures {
+            signature.validate(case)?;
         }
-        let return_type = if function.return_type.is_empty() {
-            "int".to_owned()
-        } else {
-            function.return_type.clone()
-        };
-        ensure!(
-            return_type == "void"
-                || is_supported_entry_int(&return_type).is_some()
-                || is_supported_entry_float(&return_type).is_some(),
-            "verify_port entry return type {return_type:?} requires a scalar number or void wrapper entry"
-        );
+        let harness::EntrySignature {
+            param_types,
+            return_type,
+        } = signature;
         job.state = "verifying".into();
         job.last_error = None;
         let mut evidence = Verification {
@@ -767,135 +1070,10 @@ impl Engine {
             evidence.commands.push(run);
             ensure!(ok, "{program} version probe failed");
         }
-        let count = param_types.len();
-        let args_types = if count == 0 {
-            "void".to_string()
-        } else {
-            param_types.join(", ")
-        };
-        let has_ptr_param = param_types
-            .iter()
-            .any(|t| matches!(t.as_str(), "int *" | "const int *"));
-        let source_args = param_types
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                if matches!(t.as_str(), "int *" | "const int *") {
-                    format!("&values[{i}]")
-                } else if t == "int" {
-                    format!("values[{i}]")
-                } else if t == "_Bool" {
-                    format!("(_Bool)(values[{i}] != 0)")
-                } else {
-                    format!("({t})values[{i}]")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let c_body = if return_type == "void" {
-            let mut body = format!("{entry}({source_args}); int rf_printed = 0;");
-            for (i, t) in param_types.iter().enumerate() {
-                if matches!(t.as_str(), "int *" | "const int *") {
-                    body.push_str(&format!(
-                        " if (values[{i}] != before[{i}]) {{ printf(\"%sp{i}=%d\", rf_printed ? \" \" : \"\", values[{i}]); rf_printed = 1; }}"
-                    ));
-                }
-            }
-            body.push_str(" if (!rf_printed) printf(\"void\"); printf(\"\\n\");");
-            body
-        } else if is_supported_entry_float(return_type).is_some() {
-            let mut body = format!(
-                "{return_type} rf_ret = {entry}({source_args}); printf(\"%.6f\", (double)rf_ret);"
-            );
-            if has_ptr_param {
-                for (i, t) in param_types.iter().enumerate() {
-                    if matches!(t.as_str(), "int *" | "const int *") {
-                        body.push_str(&format!(
-                            " if (values[{i}] != before[{i}]) printf(\" p{i}=%d\", values[{i}]);"
-                        ));
-                    }
-                }
-            }
-            body.push_str(" printf(\"\\n\");");
-            body
-        } else {
-            let (_, ret_unsigned) = is_supported_entry_int(return_type)
-                .context("unsupported return type in verify_inner")?;
-            let call_and_print = if return_type == "int" {
-                format!("int rf_ret = {entry}({source_args}); printf(\"%d\", rf_ret);")
-            } else if ret_unsigned {
-                format!(
-                    "{return_type} rf_ret = {entry}({source_args}); printf(\"%llu\", (unsigned long long)rf_ret);"
-                )
-            } else {
-                format!(
-                    "{return_type} rf_ret = {entry}({source_args}); printf(\"%lld\", (long long)rf_ret);"
-                )
-            };
-            let mut body = call_and_print;
-            if has_ptr_param {
-                for (i, t) in param_types.iter().enumerate() {
-                    if matches!(t.as_str(), "int *" | "const int *") {
-                        body.push_str(&format!(
-                            " if (values[{i}] != before[{i}]) printf(\" p{i}=%d\", values[{i}]);"
-                        ));
-                    }
-                }
-            }
-            body.push_str(" printf(\"\\n\");");
-            body
-        };
-        let abi_shims = if job.c_boundary_files.is_empty() {
-            String::new()
-        } else {
-            let mut shims = String::new();
-            for func in &job.functions {
-                if func.is_static || func.name == entry {
-                    continue;
-                }
-                let ret_ok = func.return_type == "void"
-                    || is_supported_entry_int(&func.return_type).is_some();
-                let params_ok = func.parameter_types.iter().all(|p| {
-                    is_supported_entry_int(p).is_some()
-                        || matches!(p.as_str(), "int *" | "const int *")
-                });
-                if !ret_ok || !params_ok {
-                    continue;
-                }
-                let plist = if func.parameter_types.is_empty() {
-                    "void".to_string()
-                } else {
-                    func.parameter_types
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| format!("{p} v{i}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let alist = (0..func.parameter_types.len())
-                    .map(|i| format!("v{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let call = if func.return_type == "void" {
-                    format!("{}({alist});", func.name)
-                } else {
-                    format!("return {}({alist});", func.name)
-                };
-                shims.push_str(&format!(
-                    "{} {}({plist});\n{} rf_abi_{}({plist}) {{ {call} }}\n",
-                    func.return_type, func.name, func.return_type, func.name
-                ));
-            }
-            shims
-        };
-        let source_harness = format!(
-            "#include <stdio.h>\n#include <stdlib.h>\n#include <limits.h>\n_Static_assert(INT_MAX == 2147483647 && INT_MIN == (-2147483647 - 1), \"requires int32\");\n{abi_shims}{return_type} {entry}({args_types});\nint main(int argc, char **argv) {{ if(argc != {}) return 2; int values[{}]; int before[{}]; for(int i=0;i<{};i++) {{ values[i]=(int)strtol(argv[i+1],0,10); before[i]=values[i]; }} {c_body} return 0; }}\n",
-            count + 1,
-            count.max(1),
-            count.max(1),
-            count
-        );
-        std::fs::write(dir.join("driver.c"), source_harness)?;
+        std::fs::write(
+            dir.join("driver.c"),
+            harness::render_c_driver(job, entry, param_types, return_type)?,
+        )?;
 
         let snapshot = self.store.directory(&job.job_id)?.join("source");
         let kb = kbuild::load(&snapshot)?;
@@ -1122,70 +1300,10 @@ impl Engine {
         }
         let include_path =
             serde_json::to_string(&candidate.join("src/lib.rs").display().to_string())?;
-        let rust_args = param_types
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                if matches!(t.as_str(), "int *" | "const int *") {
-                    format!("unsafe {{ values.as_mut_ptr().add({i}) }}")
-                } else if t == "int" {
-                    format!("values[{i}]")
-                } else if t == "_Bool" {
-                    format!("u8::from(values[{i}] != 0)")
-                } else if let Some(fty) = is_supported_entry_float(t) {
-                    format!("(values[{i}] as {fty})")
-                } else {
-                    let (rty, _) = is_supported_entry_int(t).unwrap();
-                    format!("(values[{i}] as {rty})")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let rust_body = if return_type == "void" {
-            let mut body = format!("port::rf_{entry}({rust_args}); let mut rf_printed = false;");
-            for (i, t) in param_types.iter().enumerate() {
-                if matches!(t.as_str(), "int *" | "const int *") {
-                    body.push_str(&format!(
-                        " if values[{i}] != before[{i}] {{ print!(\"{{}}p{i}={{}}\", if rf_printed {{ \" \" }} else {{ \"\" }}, values[{i}]); rf_printed = true; }}"
-                    ));
-                }
-            }
-            body.push_str(" if !rf_printed { print!(\"void\"); } println!();");
-            body
-        } else if is_supported_entry_float(return_type).is_some() {
-            let mut body = format!(
-                "let rf_ret = port::rf_{entry}({rust_args}); print!(\"{{:.6}}\", rf_ret as f64);"
-            );
-            if has_ptr_param {
-                for (i, t) in param_types.iter().enumerate() {
-                    if matches!(t.as_str(), "int *" | "const int *") {
-                        body.push_str(&format!(
-                            " if values[{i}] != before[{i}] {{ print!(\" p{i}={{}}\", values[{i}]); }}"
-                        ));
-                    }
-                }
-            }
-            body.push_str(" println!();");
-            body
-        } else if has_ptr_param {
-            let mut body =
-                format!("let rf_ret = port::rf_{entry}({rust_args}); print!(\"{{rf_ret}}\");");
-            for (i, t) in param_types.iter().enumerate() {
-                if matches!(t.as_str(), "int *" | "const int *") {
-                    body.push_str(&format!(
-                        " if values[{i}] != before[{i}] {{ print!(\" p{i}={{}}\", values[{i}]); }}"
-                    ));
-                }
-            }
-            body.push_str(" println!();");
-            body
-        } else {
-            format!("println!(\"{{}}\", port::rf_{entry}({rust_args}));")
-        };
-        let driver = format!(
-            "#[path={include_path}] mod port;\nfn main() {{ let mut values: Vec<i32> = std::env::args().skip(1).map(|v|v.parse().unwrap()).collect(); assert_eq!(values.len(),{count}); let before = values.clone(); {rust_body} }}\n"
-        );
-        std::fs::write(dir.join("driver.rs"), driver)?;
+        std::fs::write(
+            dir.join("driver.rs"),
+            harness::render_rust_driver(&include_path, entry, param_types, return_type),
+        )?;
         let rust_bin = dir.join(executable("rust-port"));
         let mut rustc_args = vec![
             "--edition=2024".into(),
